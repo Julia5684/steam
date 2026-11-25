@@ -398,6 +398,11 @@ def binding(state, step):
     return {k:route[k] for k in ("agent","model","level")}
 
 
+def needs_claude_cli(model, level, supervisor):
+    # The native Agent tool accepts family aliases. A separate CLI call can pin a full model ID.
+    return model.startswith("claude-") and (model, level) != (supervisor["model"], supervisor["level"])
+
+
 def show_plan(cfg, workspace, steps, run=None):
     result = {"status":"planned", "workspace":str(workspace), "steps":[
         {**{k:s[k] for k in ("id","route","needs","access","kind","outputs","refs")},
@@ -508,7 +513,8 @@ def advance(run, state):
                 require(artifact_path(workspace, ref).is_file(), f"Missing input: {ref}")
             step["before"] = {n:digest(artifact_path(workspace, n)) for n in step["outputs"]}
             task = task_payload(state, step)
-            native = agent["adapter"] == "claude"
+            native = agent["adapter"] == "claude" and not needs_claude_cli(
+                route["model"], route["level"], state["config"]["supervisor"])
             write_json(step_dir / "task.json", {**task, **route})
             step["status"] = state["status"] = "needs_claude" if native else "running"
             if native:
@@ -556,15 +562,20 @@ def check(cfg, workspace):
     results = {}
     for name, agent in cfg["agents"].items():
         if not agent.get("enabled", True):
-            report = {"status":"disabled", "summary":"Disabled in config"}
-        elif agent["adapter"] == "claude":
-            report = {"status":"native", "summary":"Handled by the parent Claude session; availability not probed"}
-        else:
-            try:
-                report = check_worker(name, agent, agent["models"], workspace)
-            except Exception as e:
-                report = {"status":"failed", "summary":f"{type(e).__name__}: {e}"}
-        results[name] = report
+            results[name] = {"status":"disabled", "summary":"Disabled in config"}
+            continue
+        models = agent["models"]
+        if agent["adapter"] == "claude":
+            models = {m: [lv for lv in levels if needs_claude_cli(m, lv, cfg["supervisor"])]
+                      for m, levels in models.items()}
+            models = {m: levels for m, levels in models.items() if levels}
+            if not models:
+                results[name] = {"status":"native", "summary":"Handled by the parent Claude session; availability not probed"}
+                continue
+        try:
+            results[name] = check_worker(name, agent, models, workspace)
+        except Exception as e:
+            results[name] = {"status":"failed", "summary":f"{type(e).__name__}: {e}"}
     return {"status":"ok" if all(r["status"] in ("ok","success","native","disabled","ready")
                                  for r in results.values()) else "attention", "agents":results}
 

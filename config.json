@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "supervisor": { "agent": "claude", "model": "sonnet", "level": "medium" },
+  "supervisor": { "agent": "claude", "model": "opus", "level": "high" },
   "agents": {
     "claude": {
       "enabled": true,
@@ -16,8 +16,8 @@
       "adapter": "codex",
       "executable": "codex",
       "models": {
-        "gpt-6.2-sol": ["low", "medium", "high", "xhigh"],
-        "gpt-6.2-astra": ["medium", "high", "xhigh"]
+        "gpt-6.2-sol": ["low", "medium", "high", "xhigh", "ultra"],
+        "gpt-6.2-astra": ["medium", "high", "xhigh", "ultra"]
       }
     },
     "antigravity": {
@@ -26,21 +26,26 @@
       "executable": "agy",
       "models": {
         "gemini-4-hydrogen": ["low", "medium", "high"],
-        "gemini-4-neon": ["medium", "high"]
+        "gemini-4-neon": ["medium", "high"],
+        "gemini-pro-orchestrator": ["medium"],
+        "gemini-pro-orchestrator-neon": ["high"]
       }
     }
   },
   "routes": {
-    "bug_fix":        { "description": "一般 Bug 分析、修复与回归验证", "agent": "codex", "model": "gpt-6.2-sol", "level": "medium" },
+    "bug_fix":        { "description": "一般 Bug 分析、修复与回归验证", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
     "complex_bug":    { "description": "偶现、跨模块或时序相关的复杂 Bug", "agent": "codex", "model": "gpt-6.2-astra", "level": "high" },
-    "implementation": { "description": "开发、重构及测试", "agent": "codex", "model": "gpt-6.2-sol", "level": "medium" },
-    "integration":    { "description": "把动画或特效接入业务、交互和状态机", "agent": "codex", "model": "gpt-6.2-sol", "level": "medium" },
-    "image":          { "description": "用内置生图生成或编辑位图素材", "agent": "codex", "model": "gpt-6.2-sol", "level": "low" },
-    "motion_ux":      { "description": "界面动画、转场、反馈节奏与交互设计", "agent": "claude", "model": "sonnet", "level": "medium" },
-    "vfx":            { "description": "粒子、材质、Shader 等特效的设计或制作", "agent": "antigravity", "model": "gemini-4-hydrogen", "level": "medium" },
-    "perf_capture":   { "description": "性能采样、埋点、整理已有记录", "agent": "codex", "model": "gpt-6.2-sol", "level": "medium" },
-    "perf_analysis":  { "description": "分析帧时间、GPU 或内存数据，定位瓶颈", "agent": "antigravity", "model": "gemini-4-neon", "level": "high" },
-    "perf_fix":       { "description": "落实已定位的性能优化并复测", "agent": "codex", "model": "gpt-6.2-sol", "level": "medium" }
+    "implementation": { "description": "开发、重构及测试", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
+    "integration":    { "description": "把动画或特效接入业务、交互和状态机", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
+    "image":          { "description": "用内置生图生成或编辑位图素材", "agent": "codex", "model": "gpt-6.2-astra", "level": "high" },
+    "motion_ux":      { "description": "界面动画、转场、反馈节奏与交互设计", "agent": "claude", "model": "opus", "level": "medium" },
+    "vfx":            { "description": "粒子、材质、Shader 等特效的设计或制作", "agent": "antigravity", "model": "gemini-pro-orchestrator", "level": "medium" },
+    "perf_capture":   { "description": "性能采样、埋点、整理已有记录", "agent": "codex", "model": "gpt-6.2-sol", "level": "high" },
+    "perf_analysis":  { "description": "分析帧时间、GPU 或内存数据，定位瓶颈", "agent": "antigravity", "model": "gemini-pro-orchestrator-neon", "level": "high" },
+    "perf_fix":       { "description": "落实已定位的性能优化并复测", "agent": "codex", "model": "gpt-6.2-sol", "level": "high" },
+    "review":         { "description": "代码审查，按严重度报告问题、位置和验证建议", "agent": "codex", "model": "gpt-6.2-astra", "level": "high" },
+    "project_analysis": { "description": "梳理项目架构、模块职责、调用链和变更影响", "agent": "codex", "model": "gpt-6.2-astra", "level": "high" },
+    "documentation":  { "description": "编写或更新 README、接入指南和设计说明", "agent": "claude", "model": "sonnet", "level": "medium" }
   },
   "limits": {
     "max_steps": 8,

@@ -2,17 +2,20 @@
 
 在 Claude Code Desktop 的本地 Code 会话里，输入 `/steam 任务` 即可派工。平时继续正常使用 Claude。Claude 负责分析意图、选择任务类型，以及承担配置分给它的工作。Python 脚本负责执行顺序、模型参数、结果记录和文件检查。
 
+Steam 默认只接受手动调用。Claude Code 使用 `/steam`，Codex 使用 `$steam`。Codex 可以检查环境、预览计划、查询结果，以及执行仅含 Codex 和 Antigravity 步骤的任务。包含 Claude 步骤的计划可以在 Claude Code 中执行或继续。
+
 ## 安装
 
-准备 Python 3.10 或更新版，以及准备使用的官方 CLI。Codex 通过 `codex login` 选择 ChatGPT 账号；Antigravity 使用有相应权益的 Google 个人账号登录 `agy`。首次登录和项目授权在对应客户端完成。Codex 与 Antigravity 按当前会话能找到的程序运行；也可以在配置中填写可执行文件的绝对路径。Python 只用标准库。
+准备 Python 3.10 或更新版，以及准备使用的官方 CLI。默认的文档写作和界面动画设计在 Claude Code 会话中执行。需要脚本派发的固定型号 Claude 任务还需本机已登录的 Claude Code CLI（`claude`）。Codex 通过 `codex login` 选择 ChatGPT 账号，Antigravity 使用有相应权益的 Google 个人账号登录 `agy`。首次登录和项目授权在对应客户端完成。各 CLI 可通过当前会话的 PATH 或配置中的可执行文件绝对路径定位。Python 只用标准库。
 
-解压后把整个 `steam` 文件夹放在以下位置。确认 `SKILL.md`、`config.json`、`scripts` 是同级，避免多套一层 `steam`。
+解压后把整个 `steam` 文件夹放在以下位置。确认 `SKILL.md`、`config.json`、`scripts` 和 `agents` 是同级，避免多套一层 `steam`。Claude Code 从 `SKILL.md` 的文件头读取手动调用设置，Codex 从 `agents/openai.yaml` 读取。
 
 | 环境 | 安装后的技能目录 |
 | --- | --- |
 | Windows 原生本地会话 | `%USERPROFILE%\.claude\skills\steam\` |
 | macOS / Linux 本地会话 | `~/.claude/skills/steam/` |
 | Windows 上的 WSL 会话 | 对应 Linux 发行版中的 `~/.claude/skills/steam/`，Python 和 CLI 也从该环境启动 |
+| Codex | Windows 的 `%USERPROFILE%\.agents\skills\steam\`，macOS / Linux / WSL 的 `~/.agents/skills/steam/` |
 
 若已安装旧 `/crew` 且只想保留一个入口，可把旧 `crew` 文件夹移到 `skills` 目录以外作备份。新技能首次未出现在菜单中时，可新开本地 Code 会话。安装不需要常驻服务或项目级配置。
 
@@ -24,6 +27,9 @@
 /steam 分析并修复这个 Bug：连续点击领取两次会发两份奖励。复现日志在 logs/reward.txt
 /steam 帮我给结算界面设计动画和体验，包含入场、可点击时刻和快速跳过
 /steam 为结算界面生成一枚透明金币，输出到 assets/reward/coin.png
+/steam review 当前 diff，重点看重复发奖风险，按严重度列出问题和验证建议
+/steam 分析从领取按钮到发奖服务的调用链，标出关键文件和函数
+/steam 根据这份接口说明更新 docs/rewards.md 中的接入示例
 ```
 
 | 输入 | 结果 |
@@ -32,7 +38,7 @@
 | `/steam --plan 任务` | 主管拆解，脚本校验步骤、依赖、额度和模型配置，在系统临时目录保存已校验的计划并展示将要派给谁。无需运行外部模型；稍后可用返回的 `/steam --resume` 命令直接执行同一计划。 |
 | `/steam 任务` | 脚本先执行相同的计划校验，再按依赖顺序派发；普通 Bug 通常合并为一次 Codex 调用。 |
 | `/steam --result 运行目录` | 读取该次运行的状态和结果摘要。 |
-| `/steam --resume 运行目录` | 执行已预览的计划，或从检查点继续。若预览后修改配置，先用新配置重新预览。遇到已发给 Claude 的步骤会显示 `waiting_claude`，由原会话提交回执。中断时无法判定结果的外部调用会保留待核实记录。 |
+| `/steam --resume 运行目录` | 执行已预览的计划，或从检查点继续。若预览后修改配置，先用新配置重新预览。已交给 Claude 原生会话的步骤会显示 `waiting_claude`，由原会话提交回执。中断时无法判定结果的外部调用会保留待核实记录。 |
 
 也可以直接在项目目录的终端做环境检查，全程由本机脚本执行，不启动 Claude 主管。Windows PowerShell 示例：
 
@@ -46,7 +52,7 @@ macOS、Linux 或 WSL 示例：
 python3 ~/.claude/skills/steam/scripts/flow.py check --workspace .
 ```
 
-技能每次在独立主管上下文中运行。需要使用前文所提日志、截图或参数时，在本次命令里提供可访问的项目内路径或必要信息。用户明确要求交付设计时，主管直接给设计；同时要求实现时才会派发实现步骤。
+Claude Code 每次在独立主管上下文中运行技能。需要使用前文所提日志、截图或参数时，在本次命令里提供可访问的项目内路径或必要信息。只要求界面动画设计时，`motion_ux` 交付时间线、可交互时刻和中断行为。同时要求接入工程时，`integration` 接续设计结果。
 
 ## 唯一需要维护的配置
 
@@ -56,16 +62,16 @@ python3 ~/.claude/skills/steam/scripts/flow.py check --workspace .
 | --- | --- |
 | `agents.<名称>.enabled` | 该执行器是否参与派工。例如暂时停用 Antigravity 可改成 `false`。指向该执行器的任务需改派或重新启用。 |
 | `agents.<名称>.models` | 允许该执行器用的模型，以及每个模型允许的推理等级。填写你账号实际可用且愿意使用的组合。 |
-| `agents.<名称>.executable` | 本机 CLI 的命令名或原生可执行文件的绝对路径。Claude 使用当前 Desktop 会话。 |
+| `agents.<名称>.executable` | 本机 CLI 的命令名或原生可执行文件的绝对路径。Claude 的固定版本专项任务使用此项，主管由 Desktop 会话启动。 |
 | `routes.<任务类型>` | 每类任务的说明、默认执行器 `agent`、模型 `model`、等级 `level`。修改分工时改这一行。 |
 | `limits.max_calls` / `max_steps` | 每项任务允许的派工步数。预检一次性检查整张计划。每个步骤内部可有多轮工具操作。这两项限制步数，订阅消耗取决于各产品的计量方式。 |
 | `supervisor` | 主管自身的模型和等级。保持 `agent` 指向 Claude。 |
 
-例如希望把性能分析从 Antigravity 改到 Codex，替换 `routes` 内已有的 `perf_analysis` 条目：
+例如，默认代码审查由 `routes.review` 指定。
 
 ```json
-"perf_analysis": {
-  "description": "分析帧时间、GPU 或内存数据，定位瓶颈",
+"review": {
+  "description": "代码审查，按严重度报告问题、位置和验证建议",
   "agent": "codex",
   "model": "gpt-6.2-astra",
   "level": "high"
@@ -84,7 +90,11 @@ py -3 scripts/sync_supervisor.py
 python3 scripts/sync_supervisor.py
 ```
 
-Claude 原生额外子 Agent 使用模型家族别名。若工作行与主管模型、等级相同，主管自行执行。若需要给额外 Claude 子 Agent 指定不同的 `effort`，官方要求 Claude Code v2.1.292 或更新版本，客户端或组织策略也可能覆盖设置。Antigravity 的 Gemini 行填写模型系列，脚本会匹配 `agy models` 中带相应等级的具体型号。生图行的模型与等级选择负责调用内置生图工具的 Codex，图片大小、用途与风格写在任务里。当前生图交付检查支持 PNG。若要在 Antigravity 中使用固定档位的其他模型，把模型名设为目录给出的完整 slug，等级填 `default`，并在相应任务行选用同一组合。
+默认由 `opus / high` 主管拆分任务、派工和汇总结果。文档写作交给 `sonnet / medium` 原生子 Agent，界面动画设计交给 `opus / medium` 原生子 Agent。具体模型由 Claude Code 解析家族别名。如果任务配置的模型和档位与主管相同，由主管直接执行。如果为专项任务指定了其他完整型号，脚本会通过本机 Claude Code CLI 传递该型号和档位。
+
+Antigravity 特效制作选择 Orchestrator 的 Gemini 4 Carbon（`gemini-pro-orchestrator`，`--effort medium`）。性能瓶颈分析选择 Orchestrator 的 Gemini 4 Neon（`gemini-pro-orchestrator-neon`，`--effort high`）。脚本用 `agy models` 核对 Orchestrator 型号。其他 Gemini 系列按型号和档位匹配目录项，也可填写目录给出的完整 slug，配合 `default` 使用该项自带的档位。
+
+图片生成和编辑由 `gpt-6.2-astra / high` 调用 Codex 内置生图工具。图片大小、用途与风格写在任务里，交付文件使用 PNG。
 
 ## 产物、记录与成本
 

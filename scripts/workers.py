@@ -1,4 +1,4 @@
-"""Fresh local Codex and Antigravity CLI processes. Standard library only."""
+"""Fresh local Codex, Claude and Antigravity CLI processes. Standard library only."""
 from __future__ import annotations
 
 import hashlib
@@ -25,6 +25,8 @@ DENIED = re.compile(
 )
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}\Z")
 LEVEL = re.compile(r"[a-z][a-z0-9_-]{0,30}\Z")
+AGY_SESSION_EFFORT_MODELS = {"gemini-pro-orchestrator", "gemini-pro-orchestrator-neon"}
+AGY_SESSION_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 
 class WorkerError(RuntimeError):
@@ -36,9 +38,9 @@ def _fail(message):
 
 
 def _command(adapter, agent):
-    default = {"codex": "codex", "antigravity": "agy"}.get(adapter)
+    default = {"codex": "codex", "antigravity": "agy", "claude": "claude"}.get(adapter)
     if not default:
-        raise WorkerError("Claude 子任务应由 Claude Code 主控原生派发。" if adapter == "claude" else "未知适配器。")
+        raise WorkerError("未知适配器。")
     value = str(agent.get("executable") or default)
     selected = Path(value).expanduser()
     if selected.is_absolute():
@@ -52,7 +54,7 @@ def _command(adapter, agent):
     selected = Path(found).absolute()
     if os.name == "nt" and selected.suffix.lower() in {".ps1", ".cmd", ".bat"}:
         # Never let cmd.exe interpret task text or workspace paths. npm's documented
-        # Codex entry point is JavaScript; Antigravity distributes a native binary.
+        # Codex entry point is JavaScript; the other adapters use native binaries.
         sibling = selected.with_name(default + ".exe")
         if sibling.is_file():
             return [str(sibling)]
@@ -61,7 +63,8 @@ def _command(adapter, agent):
         node_path = str(node) if node.is_file() else shutil.which("node.exe")
         if adapter == "codex" and js.is_file() and node_path:
             return [node_path, str(js)]
-        raise WorkerError(f"{selected.name} 是 shell 包装器。请设置官方 {default}.exe 的绝对路径，或安装标准 Codex npm 包。")
+        hint = "，或安装标准 Codex npm 包" if adapter == "codex" else ""
+        raise WorkerError(f"{selected.name} 是 shell 包装器。请设置官方 {default}.exe 的绝对路径{hint}。")
     if os.name == "nt" and selected.suffix.lower() != ".exe":
         raise WorkerError("Windows 需要原生 .exe 或官方 Codex npm 包装器。")
     return [str(selected)]
@@ -77,6 +80,12 @@ def _env(adapter):
     elif adapter == "antigravity":
         # A configured Gemini API-key provider should fail clearly, not charge a key.
         for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH"):
+            env.pop(name, None)
+    elif adapter == "claude":
+        # Keep the CLI's configured account and profile. Start a new session at the route's effort.
+        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
+                     "CLAUDE_SESSION_ID", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_EFFORT_LEVEL",
+                     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"):
             env.pop(name, None)
     return env
 
@@ -261,7 +270,8 @@ def _agy_catalog(command, workspace):
 
 def _catalog_key(model, level):
     stem = _slug(model)
-    if level == "default" or stem.endswith("-" + level):
+    session_effort = stem in AGY_SESSION_EFFORT_MODELS and level in AGY_SESSION_EFFORTS
+    if level == "default" or session_effort or stem.endswith("-" + level):
         return stem
     return f"{stem}-{level}"
 
@@ -423,6 +433,8 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
     args = ["--input-format", "stream-json", "--output-format", "stream-json", "--json-schema", RECEIPT_SCHEMA,
             "--model", selected, "--sandbox", "--mode",
             "plan" if task["access"] == "read" else "accept-edits"]
+    if _slug(model) in AGY_SESSION_EFFORT_MODELS and level != "default":
+        args += ["--effort", level]
     state = {"result": None, "issue": ""}
     def event(e):
         name = e.get("event")
@@ -457,6 +469,64 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
     body = result.get("structured_output")
     answer = _report(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else result.get("response"))
     answer["effective_model"] = selected
+    if _slug(model) in AGY_SESSION_EFFORT_MODELS and level != "default":
+        answer["requested_effort"] = level
+    return answer
+
+
+def _claude_login(command, workspace):
+    # Inspect only the login flag, never echo account details.
+    rc, out, _, _ = _invoke(command + ["--restricted", "auth", "status", "--json"],
+                            workspace, "claude")
+    if rc:
+        raise WorkerError("请用 claude auth status 检查本机 Claude CLI 的登录状态。")
+    try:
+        status = json.loads(out)
+    except ValueError:
+        raise WorkerError("Claude CLI 未返回可解析的登录状态。")
+    if not isinstance(status, dict) or status.get("loggedIn") is not True:
+        raise WorkerError("Claude CLI 尚未登录，请检查本机 claude auth status。")
+
+
+def _run_claude(command, model, level, task, workspace, step_dir, timeout):
+    if task["kind"] == "image":
+        raise WorkerError("本技能的原生生图管线使用 ChatGPT 登录的 Codex。")
+    tools = "Read,Grep,Glob" + (",Edit,Write" if task["access"] == "write" else "")
+    schema = Path(RECEIPT_SCHEMA).read_text(encoding="utf-8")
+    args = ["-p", "--model", model, "--effort", level, "--output-format", "json",
+            "--json-schema", schema, "--tools", tools, "--restricted",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--no-session-persistence", "--permission-prompts", "none", "--permission-mode",
+            "acceptEdits" if task["access"] == "write" else "dontAsk"]
+    rc, out, err, denied = _invoke(command + args, workspace, "claude", data=_prompt(task).encode(),
+                                  timeout=timeout, step_dir=step_dir)
+    try:
+        result = json.loads(out)
+    except ValueError:
+        raise WorkerError(f"Claude CLI 没有返回可解析的 JSON 终态。退出码 {rc}。{err[-600:]}")
+    if not isinstance(result, dict):
+        raise WorkerError("Claude CLI 终态格式无效。")
+    if (rc or denied or result.get("type") != "result" or result.get("subtype") != "success"
+            or result.get("is_error") is not False or result.get("permission_denials") or result.get("errors")):
+        detail = denied or str(result.get("errors") or result.get("subtype") or err[-600:])
+        if result.get("permission_denials"):
+            detail = "工具权限请求被拒绝，请查看本次 stdout.log。"
+        raise WorkerError(f"Claude CLI 未完成。退出码 {rc}。{detail}")
+    usage = result.get("modelUsage")
+    if isinstance(usage, dict) and usage:
+        requested = re.sub(r"\[[^\]]*\]$", "", model)
+        observed = [re.sub(r"\[[^\]]*\]$", "", name) for name in usage if isinstance(name, str)]
+        matches = [name for name in observed if name == requested
+                   or (not re.search(r"-\d{8}$", requested)
+                       and re.fullmatch(re.escape(requested) + r"-\d{8}", name))]
+        if not matches:
+            raise WorkerError(f"Claude CLI 用量中的实际模型与指定型号不符：{', '.join(observed)}")
+    body = result.get("structured_output")
+    if not isinstance(body, dict):
+        raise WorkerError("Claude CLI 未返回符合 schema 的结构化回执。")
+    answer = _report(json.dumps(body, ensure_ascii=False))
+    answer["requested_model"] = model
+    answer["requested_effort"] = level
     return answer
 
 
@@ -472,7 +542,7 @@ def run_worker(agent_id, agent, model, level, task, workspace, step_dir):
         timeout = int(agent.get("timeout_seconds", 1800))
         if timeout < 1:
             raise WorkerError("timeout_seconds 必须大于零。")
-        run = _run_codex if adapter == "codex" else _run_agy
+        run = {"codex": _run_codex, "antigravity": _run_agy, "claude": _run_claude}[adapter]
         return run(command, model, level, task, Path(workspace), Path(step_dir), timeout)
     except (WorkerError, OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
         return _fail(f"{agent_id}：{exc}")
@@ -482,11 +552,15 @@ def check_worker(agent_id, agent, models, workspace):
     """Check installation, account and visible model options without an inference turn."""
     try:
         adapter = agent["adapter"]
-        if adapter == "claude":
-            return {"status": "success", "summary": "Claude 由当前 Claude Code 会话派发，模型权限在原生子任务中验证。"}
         command = _command(adapter, agent)
         version, err = _probe(command + ["--version"], workspace, adapter)
         version = (version or err).splitlines()[-1][:160]
+        if adapter == "claude":
+            _claude_login(command, workspace)
+            return {"status": "success", "summary": f"{version}。Claude CLI 已登录。专项任务显式指定完整型号和档位，实际模型权限以任务结果为准。",
+                    "models": models, "version": version}
+        unverified_efforts = {}
+        verified_summary = " CLI 目录已列出全部配置的型号与等级，实际权限以运行结果为准。"
         if adapter == "codex":
             _login(command, workspace)
             summary = f"{version}。已确认 ChatGPT 登录。"
@@ -511,13 +585,33 @@ def check_worker(agent_id, agent, models, workspace):
                 present = [lv for lv in levels if _catalog_key(model, lv) in catalog]
                 if present:
                     available[model] = present
+                    if _slug(model) in AGY_SESSION_EFFORT_MODELS:
+                        pending = [lv for lv in present if lv != "default"]
+                        if pending:
+                            unverified_efforts[model] = pending
+            if unverified_efforts:
+                try:
+                    out, err = _probe(command + ["--help"], workspace, adapter)
+                    option = re.search(r"(?ms)^\s*(?:-\w,\s*)?--effort\b(.*?)(?=^\s*--[\w-]+|\Z)", out + "\n" + err)
+                    supported = {lv for lv in AGY_SESSION_EFFORTS
+                                 if option and re.search(rf"\b{lv}\b", option.group(1))}
+                except WorkerError:
+                    supported = set()
+                unverified_efforts = {model: [lv for lv in levels if lv not in supported]
+                                      for model, levels in unverified_efforts.items()}
+                unverified_efforts = {model: levels for model, levels in unverified_efforts.items() if levels}
+                verified_summary = " CLI 目录已列出全部配置型号，固定档位由目录匹配，Orchestrator 档位通过 CLI 声明支持的 --effort 传入，实际权限与采用情况以运行结果为准。"
         missing = {model: [level for level in levels if level not in available.get(model, [])]
                    for model, levels in models.items()}
         missing = {model: levels for model, levels in missing.items() if levels}
         if missing:
             return {"status": "attention", "summary": summary + " CLI 目录未列出 missing_models 中的配置型号或等级，请核对配置。",
-                    "models": available, "missing_models": missing, "version": version}
-        return {"status": "success", "summary": summary + " CLI 目录已列出全部配置的型号与等级，实际权限以运行结果为准。",
+                    "models": available, "missing_models": missing, "unverified_efforts": unverified_efforts,
+                    "version": version}
+        if unverified_efforts:
+            return {"status": "attention", "summary": summary + " Orchestrator 型号已列出，但 CLI 帮助未确认 --effort 支持 unverified_efforts 中的档位。",
+                    "models": available, "unverified_efforts": unverified_efforts, "version": version}
+        return {"status": "success", "summary": summary + verified_summary,
                 "models": available, "version": version}
     except (WorkerError, OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError) as exc:
         return _fail(f"{agent_id}：{exc}")
