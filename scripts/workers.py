@@ -25,8 +25,6 @@ DENIED = re.compile(
 )
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}\Z")
 LEVEL = re.compile(r"[a-z][a-z0-9_-]{0,30}\Z")
-AGY_SESSION_EFFORT_MODELS = {"gemini-pro-orchestrator", "gemini-pro-orchestrator-neon"}
-AGY_SESSION_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 
 class WorkerError(RuntimeError):
@@ -74,8 +72,10 @@ def _env(adapter):
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     if adapter == "codex":
+        # A standalone Windows CLI cannot reuse the desktop Core's package identity.
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
-                     "CODEX_THREAD_ID", "CODEX_THREAD_SOURCE", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"):
+                     "CODEX_THREAD_ID", "CODEX_THREAD_SOURCE", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+                     "CODEX_WINDOWS_REGISTERED_CORE", "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY"):
             env.pop(name, None)
     elif adapter == "antigravity":
         # A configured Gemini API-key provider should fail clearly, not charge a key.
@@ -270,8 +270,7 @@ def _agy_catalog(command, workspace):
 
 def _catalog_key(model, level):
     stem = _slug(model)
-    session_effort = stem in AGY_SESSION_EFFORT_MODELS and level in AGY_SESSION_EFFORTS
-    if level == "default" or session_effort or stem.endswith("-" + level):
+    if level == "default" or stem.endswith("-" + level):
         return stem
     return f"{stem}-{level}"
 
@@ -433,8 +432,6 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
     args = ["--input-format", "stream-json", "--output-format", "stream-json", "--json-schema", RECEIPT_SCHEMA,
             "--model", selected, "--sandbox", "--mode",
             "plan" if task["access"] == "read" else "accept-edits"]
-    if _slug(model) in AGY_SESSION_EFFORT_MODELS and level != "default":
-        args += ["--effort", level]
     state = {"result": None, "issue": ""}
     def event(e):
         name = e.get("event")
@@ -469,8 +466,6 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
     body = result.get("structured_output")
     answer = _report(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else result.get("response"))
     answer["effective_model"] = selected
-    if _slug(model) in AGY_SESSION_EFFORT_MODELS and level != "default":
-        answer["requested_effort"] = level
     return answer
 
 
@@ -559,7 +554,6 @@ def check_worker(agent_id, agent, models, workspace):
             _claude_login(command, workspace)
             return {"status": "success", "summary": f"{version}。Claude CLI 已登录。专项任务显式指定完整型号和档位，实际模型权限以任务结果为准。",
                     "models": models, "version": version}
-        unverified_efforts = {}
         verified_summary = " CLI 目录已列出全部配置的型号与等级，实际权限以运行结果为准。"
         if adapter == "codex":
             _login(command, workspace)
@@ -585,32 +579,13 @@ def check_worker(agent_id, agent, models, workspace):
                 present = [lv for lv in levels if _catalog_key(model, lv) in catalog]
                 if present:
                     available[model] = present
-                    if _slug(model) in AGY_SESSION_EFFORT_MODELS:
-                        pending = [lv for lv in present if lv != "default"]
-                        if pending:
-                            unverified_efforts[model] = pending
-            if unverified_efforts:
-                try:
-                    out, err = _probe(command + ["--help"], workspace, adapter)
-                    option = re.search(r"(?ms)^\s*(?:-\w,\s*)?--effort\b(.*?)(?=^\s*--[\w-]+|\Z)", out + "\n" + err)
-                    supported = {lv for lv in AGY_SESSION_EFFORTS
-                                 if option and re.search(rf"\b{lv}\b", option.group(1))}
-                except WorkerError:
-                    supported = set()
-                unverified_efforts = {model: [lv for lv in levels if lv not in supported]
-                                      for model, levels in unverified_efforts.items()}
-                unverified_efforts = {model: levels for model, levels in unverified_efforts.items() if levels}
-                verified_summary = " CLI 目录已列出全部配置型号，固定档位由目录匹配，Orchestrator 档位通过 CLI 声明支持的 --effort 传入，实际权限与采用情况以运行结果为准。"
         missing = {model: [level for level in levels if level not in available.get(model, [])]
                    for model, levels in models.items()}
         missing = {model: levels for model, levels in missing.items() if levels}
         if missing:
             return {"status": "attention", "summary": summary + " CLI 目录未列出 missing_models 中的配置型号或等级，请核对配置。",
-                    "models": available, "missing_models": missing, "unverified_efforts": unverified_efforts,
+                    "models": available, "missing_models": missing, "unverified_efforts": {},
                     "version": version}
-        if unverified_efforts:
-            return {"status": "attention", "summary": summary + " Orchestrator 型号已列出，但 CLI 帮助未确认 --effort 支持 unverified_efforts 中的档位。",
-                    "models": available, "unverified_efforts": unverified_efforts, "version": version}
         return {"status": "success", "summary": summary + verified_summary,
                 "models": available, "version": version}
     except (WorkerError, OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError) as exc:

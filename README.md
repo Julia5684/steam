@@ -92,7 +92,7 @@ python3 scripts/sync_supervisor.py
 
 默认由 `opus / high` 主管拆分任务、派工和汇总结果。文档写作交给 `sonnet / medium` 原生子 Agent，界面动画设计交给 `opus / medium` 原生子 Agent。具体模型由 Claude Code 解析家族别名。如果任务配置的模型和档位与主管相同，由主管直接执行。如果为专项任务指定了其他完整型号，脚本会通过本机 Claude Code CLI 传递该型号和档位。
 
-Antigravity 特效制作选择 Orchestrator 的 Gemini 4 Carbon（`gemini-pro-orchestrator`，`--effort medium`）。性能瓶颈分析选择 Orchestrator 的 Gemini 4 Neon（`gemini-pro-orchestrator-neon`，`--effort high`）。脚本用 `agy models` 核对 Orchestrator 型号。其他 Gemini 系列按型号和档位匹配目录项，也可填写目录给出的完整 slug，配合 `default` 使用该项自带的档位。
+Antigravity 按 `agy models` 返回的目录选择型号和档位。使用 Orchestrator 时，Carbon 对应 `gemini-pro-orchestrator`，Neon 对应 `gemini-pro-orchestrator-neon`。AGY 1.5.17 对这两个目录项使用产品默认档位，在 `agents` 和 `routes` 里填 `default`。需要固定档位时，选择目录里带相应档位的型号，例如 `gemini-4-neon` 配 `high` 会匹配 `gemini-4-neon-high`。`--check` 会列出当前目录缺少的组合。
 
 图片生成和编辑由 `gpt-6.2-astra / high` 调用 Codex 内置生图工具。图片大小、用途与风格写在任务里，交付文件使用 PNG。
 
@@ -114,7 +114,7 @@ Antigravity 特效制作选择 Orchestrator 的 Gemini 4 Carbon（`gemini-pro-or
 
 保存计划时先创建运行状态和步骤目录，各步骤文件随执行生成。外部执行器写入两份日志，Claude 原生步骤保存回执。返回给主管的是短摘要，完整结果和诊断保留在运行目录中。续跑时会校验运行目录所属项目及保存的计划，并使用本机安装目录的配置派发。旧版系统临时目录中的运行仍支持原路径的查询、续跑和回执提交，沿用原文件名。
 
-使用 Git 的项目可在自己的 `.gitignore` 中加入 `/.workbench/steam-run-*/`，将运行记录保留在本地。运行目录随项目保留，可在任务结束后按需归档或删除。
+Claude Code 会将计划和回执的输入 JSON 写到项目的 `.workbench/steam-inputs/`。每份输入使用独立文件名，Shell 命令只传文件路径。使用 Git 的项目可在自己的 `.gitignore` 中加入 `/.workbench/steam-run-*/` 和 `/.workbench/steam-inputs/`。任务结束后可按需归档或删除这些记录。
 
 如果领取 Claude 步骤的会话已经结束，可核对工程改动、产物或原会话记录。核实结果后，从 `run-state.json`（旧版运行使用 `state.json`）中取出该步骤的 `claim`，用 `flow.py complete --run-dir <目录> --step <ID> --claim <领取码> --reply <回执文件>` 补交 JSON 回执。回执包含 `status`（`success` 或 `failed`）及非空的 `summary`。领取码引入前已经发出的步骤沿用原命令，省略 `--claim`。仍无法判定结果时，保留待核实状态。
 

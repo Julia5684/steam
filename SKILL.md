@@ -7,6 +7,7 @@ user-invocable: true
 allowed-tools:
   - 'Bash(py -3 "${CLAUDE_SKILL_DIR}/scripts/flow.py" *)'
   - 'Bash(python3 "${CLAUDE_SKILL_DIR}/scripts/flow.py" *)'
+  - 'Edit(./.workbench/steam-inputs/*.json)'
 context: fork
 agent: general-purpose
 background: false
@@ -32,10 +33,12 @@ effort: high
 ```
 
 3. `access` 取 `read` 或 `write`。修改代码但事先未知要改哪些文件，可用 `write/text` 并要求执行器报告 diff 和测试。交付指定文件用 `write/files`，填写目标路径。内置生图用 `write/image`，提供至少一个 .png 目标。`refs` 和 `outputs` 都是项目内相对文件路径。合并重复步骤；普通任务不安排全员复审。
-4. 用户使用 `--plan` 时运行 `plan --save --workspace <目录> --spec -`。展示分工、返回的运行目录和对应客户端的 `--resume` 命令。正式执行用 `run --workspace <目录> --spec -`，脚本先校验完整计划。预览和执行的记录保存在项目的 `.workbench/<task_id>/`，续跑沿用原目录。计划和回执都以 UTF-8 JSON 从标准输入传入。Claude Code 的 Bash 命令末尾加 `<<'STEAM_JSON'`，下一行开始写 JSON，最后用独占一行的 `STEAM_JSON` 结束。其他情况下用当前 shell 的字面量文本机制，也可传入临时 UTF-8 JSON 文件。任务原文仅作为 JSON 数据传入。
-5. 等待同一进程。达到工具等待时限时继续等待或查看同一运行目录。脚本通过 Claude Code CLI 执行需要固定完整型号的专项任务。仅在本次 `run` 或 `continue` 返回 `needs_claude` 和 `next` 时执行原生简报，保留 `next.claim` 用于提交。模型与等级均与主管相同时直接做，其他原生简报调用前台 general-purpose Agent，显式传目标模型别名与 effort。所选档位无法落实时如实登记失败。独立设计稿保留完整内容，较长设计可写用户指定的项目文件。
-6. 以 `complete --run-dir <目录> --step <ID> --claim <next.claim> --reply -` 提交 UTF-8 JSON `{"status":"success","summary":"完整交付或文件位置、证据"}` 或 `{"status":"failed","summary":"具体原因"}`。回执格式有误时，用同一领取码更正回执即可。返回 `ready` 时再运行 `continue`。看到 `waiting_claude` 表示简报已经发出，报告等待中的步骤及运行目录，由领取简报的会话提交。任务是否执行完仍不确定时，保留现场供核实。
-7. 汇报实际完成的步骤、用户需要的结果或文件、针对性验证和阻塞项。需要全文时仅查看本次运行对应的 `steps/<步骤ID>/step-result.json`（旧版运行使用 `result.json`）。避免把过程日志重复送进模型。给出本次运行目录，便于用户查验。
+4. 在 Claude Code 中，每份计划或回执都先运行 `input-path --workspace "<项目目录>"`，用原生 Write 工具把完整 JSON 写入返回的 `path`。Write 成功后，将该文件的路径作为 `--spec` 或 `--reply` 的参数，路径加双引号。任务正文只进入文件。Codex 也可用 `-` 从标准输入传入 UTF-8 JSON。
+
+   用户使用 `--plan` 时运行 `plan --save --workspace "<目录>" --spec "<计划文件>"`，展示分工、运行目录和对应客户端的 `--resume` 命令。正式执行用 `run --workspace "<目录>" --spec "<计划文件>"`。运行记录保存在项目的 `.workbench/<task_id>/`，续跑沿用原目录。
+5. 等待同一进程。达到工具等待时限时继续等待或查看同一运行目录。脚本通过 Claude Code CLI 执行需要固定完整型号的专项任务。仅在本次 `run` 或 `continue` 返回 `needs_claude` 和 `next` 时执行原生简报，保留 `next.claim` 用于提交。模型与等级均与主管相同时直接做，其他原生简报调用前台 general-purpose Agent，把 `next.model` 和 `next.level` 分别填入工具调用的 `model` 和 `effort` 参数。工具缺少所需参数或拒绝目标值时，直接提交 `failed` 回执并注明原因。独立设计稿保留完整内容，较长设计可写用户指定的项目文件。
+6. 按第 4 步写入新的回执文件，内容为 `{"status":"success","summary":"完整交付或文件位置、证据"}` 或 `{"status":"failed","summary":"具体原因"}`。以 `complete --run-dir "<目录>" --step <ID> --claim <next.claim> --reply "<回执文件>"` 提交。格式有误时，保留领取码，用新输入文件更正回执。返回 `ready` 时再运行 `continue`。看到 `waiting_claude` 表示简报已经发出，报告等待中的步骤及运行目录，由领取简报的会话提交。任务是否执行完仍不确定时，保留现场供核实。
+7. 按步骤回执汇报结果、验证依据和阻塞项，给出本次运行目录。需要完整结果时读取 `steps/<步骤ID>/step-result.json`（旧版为 `result.json`）。外部执行器已完成的步骤由主管直接汇总。用户要求实际运行验证时，把验证写进步骤简报交给执行器。
 
 本次请求
 

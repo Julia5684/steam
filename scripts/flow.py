@@ -696,6 +696,8 @@ def cli():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("catalog").add_argument("--short", action="store_true")
+    sub.add_parser("input-path", help="Prepare a fresh path for a JSON plan or receipt").add_argument(
+        "--workspace", required=True)
     for name in ("check", "plan", "run"):
         c = sub.add_parser(name)
         c.add_argument("--workspace", required=True)
@@ -711,6 +713,11 @@ def cli():
             c.add_argument("--claim", help="Claim from the original Claude handoff")
             c.add_argument("--reply", required=True)
     args = p.parse_args()
+    if args.cmd == "input-path":
+        directory = workspace_path(args.workspace) / WORKBENCH / "steam-inputs"
+        require(directory.resolve() == directory, f"Redirected STEAM input directory: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+        return {"status": "ok", "path": str(directory / (secrets.token_hex(16) + ".json"))}
     if args.cmd in ("catalog", "check", "plan", "run"):
         cfg = config()
         from sync_supervisor import check_synced
