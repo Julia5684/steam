@@ -12,6 +12,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import zlib
 
 
@@ -24,6 +25,7 @@ ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Only these DOS device names can pass the ASCII step ID syntax above.
 WINDOWS_DEVICE_ID = re.compile(r"CON|PRN|AUX|NUL|(?:COM|LPT)[1-9]", re.I)
 TERMINAL = {"success", "failed", "interrupted"}
+STEP_TERMINAL = TERMINAL | {"blocked"}
 
 
 class Invalid(ValueError):
@@ -100,6 +102,31 @@ def atomic_write(path, text):
 
 def write_json(path, value):
     atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def timing(record):
+    result = {key:record[key] for key in ("created_at", "started_at", "finished_at", "interrupted_at")
+              if key in record}
+    ended_at = record.get("finished_at") or record.get("interrupted_at")
+    if "started_at" in record and (ended_at or record.get("status") not in STEP_TERMINAL):
+        started = datetime.fromisoformat(record["started_at"])
+        ended = datetime.fromisoformat(ended_at) if ended_at else datetime.now(timezone.utc)
+        result["elapsed_seconds"] = max(0, int((ended - started).total_seconds()))
+    return result
+
+
+def progress(steps):
+    counts = dict.fromkeys(("pending", "running", "needs_claude", "success", "failed", "interrupted", "blocked"), 0)
+    for step in steps:
+        counts[step.get("status", "pending")] += 1
+    completed = sum(counts[status] for status in STEP_TERMINAL)
+    counts["waiting_claude"] = counts.pop("needs_claude")
+    return {"total":len(steps), "completed":completed, "remaining":len(steps) - completed,
+            "all_settled":completed == len(steps), **counts}
 
 
 def nonempty(value):
@@ -389,7 +416,7 @@ def finish(run, state, step, report):
         except (OSError, ValueError, RuntimeError) as e:
             report = dict(report, status="failed", worker_summary=report["summary"], summary=str(e))
     status = report["status"]
-    result = dict(report, id=sid, outputs=verified)
+    result = dict(report, id=sid, outputs=verified, finished_at=timestamp())
     write_json(run.result_path(sid), result)
     commit_result(run, state, step, result)
 
@@ -400,14 +427,17 @@ def commit_result(run, state, step, result):
     if provenance:
         step["image_provenance"] = provenance
     step.update(status=status, summary=result["summary"], verified_outputs=result.get("outputs", []))
+    step.update({key:result[key] for key in ("finished_at", "interrupted_at") if key in result})
     by_id = {s["id"]:s for s in state["steps"]}
     for future in state["steps"]:  # Topological order propagates failed prerequisites once.
         if future["status"] == "pending":
             blocked = [d for d in future["needs"] if by_id[d]["status"] in ("failed","blocked","interrupted")]
             if blocked:
-                future.update(status="blocked", summary="Unavailable prerequisites: " + ", ".join(blocked))
+                future.update(status="blocked", summary="Unavailable prerequisites: " + ", ".join(blocked),
+                              finished_at=timestamp())
                 write_json(run.result_path(future["id"]),
-                           {"id":future["id"], "status":"blocked", "summary":future["summary"], "outputs":[]})
+                           {"id":future["id"], "status":"blocked", "summary":future["summary"], "outputs":[],
+                            "finished_at":future["finished_at"]})
     statuses = {s["status"] for s in state["steps"]}
     if "pending" in statuses:
         state["status"] = "ready"
@@ -417,6 +447,8 @@ def commit_result(run, state, step, result):
         state["status"] = "failed"
     else:
         state["status"] = "success"
+    if state["status"] in TERMINAL:
+        state["finished_at"] = timestamp()
     write_json(run.state_path, state)
 
 
@@ -438,8 +470,8 @@ def task_payload(run, state, step):
     return payload
 
 
-def binding(state, step):
-    route = state["config"]["routes"][step["route"]]
+def binding(cfg, step):
+    route = cfg["routes"][step["route"]]
     return {k:route[k] for k in ("agent","model","level")}
 
 
@@ -448,10 +480,16 @@ def needs_claude_cli(model, level, supervisor):
     return model.startswith("claude-") and (model, level) != (supervisor["model"], supervisor["level"])
 
 
+def describe_step(cfg, step):
+    return {**{k:step[k] for k in ("id","route","needs","access","kind","refs")},
+            "brief":step["brief"][:600], "status":step.get("status", "pending"),
+            **binding(cfg, step), **timing(step)}
+
+
 def show_plan(cfg, workspace, steps, run=None):
     result = {"status":"planned", "workspace":str(workspace), "steps":[
-        {**{k:s[k] for k in ("id","route","needs","access","kind","outputs","refs")},
-         **binding({"config":cfg}, s)} for s in steps]}
+        {**describe_step(cfg, s), "outputs":s["outputs"]} for s in steps],
+        "progress":progress(steps)}
     if run is not None:
         result["run_dir"] = str(run.path)
     return result
@@ -459,9 +497,11 @@ def show_plan(cfg, workspace, steps, run=None):
 
 def snapshot(run, state, handoff=None):
     if state["status"] == "planned":
-        return show_plan(state["config"], state["workspace"], state["steps"], run)
+        return {**show_plan(state["config"], state["workspace"], state["steps"], run), **timing(state)}
     out = {"status":state["status"], "run_dir":str(run.path),
-           "steps":[{"id":s["id"],"status":s["status"],
+           "workspace":state["workspace"], "progress":progress(state["steps"]), **timing(state),
+           "steps":[{**describe_step(state["config"], s),
+                     "declared_outputs":s["outputs"],
                      **({"summary":s["summary"][:600]} if "summary" in s else {}),
                      **({"full_result":f"steps/{s['id']}/{run.result_name}"} if len(s.get("summary","")) > 600 else {}),
                      **({"image_provenance":s["image_provenance"]} if "image_provenance" in s else {}),
@@ -474,19 +514,46 @@ def snapshot(run, state, handoff=None):
     return out
 
 
+def query_result(run):
+    state = read_state(run)
+    active = recover = False
+    if state["status"] == "running":
+        # An external launch holds the lock until its receipt is committed.
+        try:
+            with lock(run, probe=True):
+                state = read_state(run)
+                recover = state["status"] == "running"
+        except Busy:
+            state = read_state(run)
+            active = state["status"] == "running"
+    if state["status"] == "needs_claude":
+        waiting = next(s for s in state["steps"] if s["status"] == "needs_claude")
+        recover = run.result_path(waiting["id"]).is_file()
+    out = snapshot(run, state)
+    if recover:
+        out["summary"] = "Use continue --one-step to reconcile the saved step result."
+        if state["status"] == "running":
+            out["summary"] = "The previous launch stopped. Use continue --one-step to check its receipt."
+            for step in out["steps"]:
+                if step["status"] == "running":
+                    step.pop("elapsed_seconds", None)
+    return {**out, "execution_active":active, "recovery_required":recover}
+
+
 @contextmanager
-def lock(run):
-    with run.lock_path.open("r+b") as f:
+def lock(run, *, probe=False):
+    with run.lock_path.open("rb" if probe else "r+b") as f:
         if os.name == "nt":
             import msvcrt
             try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBRLCK if probe else msvcrt.LK_NBLCK, 1)
             except OSError as exc:
                 raise Busy() from exc
         else:
             import fcntl
             try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                mode = fcntl.LOCK_SH if probe else fcntl.LOCK_EX
+                fcntl.flock(f, mode | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise Busy() from exc
         yield  # Closing the descriptor releases the OS lock even on process termination.
@@ -510,7 +577,8 @@ def new_run(cfg, workspace, steps, status="ready"):
     for step in steps:
         (run.path / "steps" / step["id"]).mkdir(parents=True)
         step["status"] = "pending"
-    state = {"version":2, "run_id":run.path.name, "workspace":str(workspace), "status":status, "config":cfg, "steps":steps}
+    state = {"version":2, "run_id":run.path.name, "workspace":str(workspace), "status":status,
+             "config":cfg, "steps":steps, "created_at":timestamp()}
     write_json(run.state_path, state)
     return run
 
@@ -542,7 +610,7 @@ def read_journal(run, step):
     return read_json(path) if path.is_file() else None
 
 
-def advance(run, state):
+def advance(run, state, *, one_step=False):
     activating = state["status"] == "planned"
     if activating:
         activate_plan(run, state)
@@ -556,13 +624,14 @@ def advance(run, state):
         if result is not None:
             # Crash between writing the verified result and committing state. No relaunch.
             commit_result(run, state, step, result)
-            if state["status"] in TERMINAL:
+            if one_step or state["status"] in TERMINAL:
                 return
         else:
-            result = {"id":step["id"], "status":"interrupted", "summary":message}
+            result = {"id":step["id"], "status":"interrupted", "summary":message,
+                      "interrupted_at":timestamp()}
             write_json(run.result_path(step["id"]), result)
             commit_result(run, state, step, result)
-            if state["status"] in TERMINAL:
+            if one_step or state["status"] in TERMINAL:
                 return
     workspace = Path(state["workspace"])
     if not run.legacy and not activating and any(s["status"] == "pending" for s in state["steps"]):
@@ -577,9 +646,12 @@ def advance(run, state):
     for step in state["steps"]:
         if step["status"] != "pending":
             continue
-        route = binding(state, step)
+        route = binding(state["config"], step)
         agent_id = route["agent"]
         agent = state["config"]["agents"][agent_id]
+        step["started_at"] = timestamp()
+        if "started_at" not in state and all(s["status"] == "pending" for s in state["steps"]):
+            state["started_at"] = step["started_at"]
         try:
             step_dir = run.step_dir(step["id"])
             require(workspace.is_dir() and workspace.resolve() == workspace,
@@ -604,7 +676,7 @@ def advance(run, state):
         except Exception as e:
             report = {"status":"failed", "summary":f"{type(e).__name__}: {e}"}
         finish(run, state, step, report)
-        if state["status"] == "failed":
+        if one_step or state["status"] == "failed":
             return
 
 
@@ -708,6 +780,8 @@ def cli():
     for name in ("continue", "result", "complete"):
         c = sub.add_parser(name)
         c.add_argument("--run-dir", required=True)
+        if name == "continue":
+            c.add_argument("--one-step", action="store_true", help="Return after one step or recovered result")
         if name == "complete":
             c.add_argument("--step", required=True)
             c.add_argument("--claim", help="Claim from the original Claude handoff")
@@ -731,22 +805,24 @@ def cli():
         steps = validate(spec, cfg, workspace)
         if args.cmd == "plan":
             run = new_run(cfg, workspace, steps, status="planned") if args.save else None
-            return show_plan(cfg, workspace, steps, run)
+            return snapshot(run, read_state(run)) if run is not None else show_plan(cfg, workspace, steps)
         run = new_run(cfg, workspace, steps)
-        print(f"run_dir={run}", file=sys.stderr, flush=True)
+        print(f"run_dir={run.path}", file=sys.stderr, flush=True)
     else:
         run = owned_run(args.run_dir)
     if args.cmd == "result":
-        return snapshot(run, read_state(run))
+        return query_result(run)
     try:
         with lock(run):
             state = read_state(run)
             handoff = None
+            recovered = False
             if state["status"] == "needs_claude":
                 waiting = next(s for s in state["steps"] if s["status"] == "needs_claude")
                 result = read_journal(run, waiting)
                 if result is not None:
                     commit_result(run, state, waiting, result)
+                    recovered = True
             if args.cmd == "complete":
                 step = next((s for s in state["steps"] if s["id"] == args.step), None)
                 require(step is not None, f"Unknown step: {args.step}")
@@ -754,11 +830,13 @@ def cli():
                 # Handoffs issued before claims were introduced are completed without a token.
                 require(step.get("claim") == args.claim, "Use the claim from the original Claude handoff")
                 finish(run, state, step, native_report(args.reply, run, step["id"]))
-            else:
-                handoff = advance(run, state)
+            elif not (args.cmd == "continue" and args.one_step and recovered):
+                handoff = advance(run, state, one_step=args.cmd == "continue" and args.one_step)
             return snapshot(run, state, handoff)
     except Busy:
-        return {"status":"busy", "run_dir":str(run.path), "summary":"Another invocation holds this run lock"}
+        out = snapshot(run, read_state(run))
+        return {**out, "run_status":out["status"], "status":"busy", "execution_active":out["status"] == "running",
+                "recovery_required":False, "summary":"Another invocation holds this run lock"}
 
 
 if __name__ == "__main__":
