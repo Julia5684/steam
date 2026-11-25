@@ -33,7 +33,7 @@
     }
   },
   "routes": {
-    "bug_fix":        { "description": "一般 Bug 分析、修复与回归验证", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
+    "bug_fix":        { "description": "一般 Bug 分析、修复与回归验证", "agent": "codex", "model": "gpt-6.2-sol", "level": "high" },
     "complex_bug":    { "description": "偶现、跨模块或时序相关的复杂 Bug", "agent": "codex", "model": "gpt-6.2-astra", "level": "high" },
     "implementation": { "description": "开发、重构及测试", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
     "integration":    { "description": "把动画或特效接入业务、交互和状态机", "agent": "codex", "model": "gpt-6.2-sol", "level": "ultra" },
@@ -49,6 +49,6 @@
   },
   "limits": {
     "max_steps": 8,
-    "max_calls": { "codex": 5, "antigravity": 1, "claude": 2 }
+    "max_calls": { "codex": 5, "antigravity": 2, "claude": 2 }
   }
 }
