@@ -11,11 +11,14 @@ import struct
 import sys
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 import zlib
 
 
 sys.dont_write_bytecode = True  # A project-local skill must not generate cache files there.
 ROOT = Path(__file__).resolve().parents[1]
+WORKBENCH = ".workbench"
+RUN_ID = re.compile(r"steam-run-[a-z0-9_]{8}")
 STEP_FIELDS = {"id", "route", "brief", "needs", "access", "kind", "outputs", "refs"}
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Only these DOS device names can pass the ASCII step ID syntax above.
@@ -29,6 +32,33 @@ class Invalid(ValueError):
 
 class Busy(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Run:
+    path: Path
+    legacy: bool = False
+
+    @property
+    def state_path(self):
+        return self.path / ("state.json" if self.legacy else "run-state.json")
+
+    @property
+    def lock_path(self):
+        return self.path / ("lock" if self.legacy else "run.lock")
+
+    @property
+    def result_name(self):
+        return "result.json" if self.legacy else "step-result.json"
+
+    def step_dir(self, step_id):
+        path = self.path / "steps" / step_id
+        require(self.legacy or (path.is_dir() and path.resolve() == path),
+                f"Missing or redirected STEAM step directory: {path}")
+        return path
+
+    def result_path(self, step_id):
+        return self.step_dir(step_id) / self.result_name
 
 
 def require(condition, message):
@@ -52,15 +82,24 @@ def read_json(path):
     return parse_json(Path(path).read_text(encoding="utf-8"))
 
 
+def atomic_write(path, text):
+    # Exclusive creation protects the temporary file in the worker's workspace.
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", suffix=".tmp",
+                                         dir=path.parent, delete=False) as f:
+            temp = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
 def write_json(path, value):
-    # Replace atomically, including on Windows. state.json is the recovery journal.
-    temp = path.with_suffix(".tmp")
-    with temp.open("w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
+    atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
 def nonempty(value):
@@ -158,7 +197,7 @@ def artifact_path(workspace, value):
     return current
 
 
-def validate(spec, cfg, workspace):
+def validate(spec, cfg, workspace, *, legacy=False, check_refs=True):
     require(isinstance(spec, dict) and set(spec) == {"steps"}, "Spec must contain only steps")
     rows = spec["steps"]
     limit = cfg["limits"]["max_steps"]
@@ -197,6 +236,11 @@ def validate(spec, cfg, workspace):
                 f"{sid}: files/image require outputs, text requires an empty outputs list")
         for path in task["refs"] + task["outputs"]:
             artifact_path(workspace, path)
+        if not legacy:
+            for path in task["outputs"]:
+                parts = os.path.normcase(path).replace("\\", "/").split("/")
+                require(parts[0] != WORKBENCH or len(parts) > 1 and not RUN_ID.fullmatch(parts[1]),
+                        f"{sid}: output conflicts with STEAM records: {path}")
         if task["kind"] == "image":
             require(cfg["agents"][agent]["adapter"] == "codex",
                     f"{sid}: image generation requires a route using the Codex image-capable adapter")
@@ -222,11 +266,12 @@ def validate(spec, cfg, workspace):
             require(previous is None or previous in ancestors[sid],
                     f"{sid}: shared output {path} needs an explicit dependency on {previous}")
             writers[path] = sid
-    for sid, task in by_id.items():
-        for path in task["refs"]:
-            exists = artifact_path(workspace, path).is_file()
-            upstream = any(path in by_id[d]["outputs"] for d in ancestors[sid])
-            require(exists or upstream, f"{sid}: missing ref {path}; declare a producing dependency")
+    if check_refs:
+        for sid, task in by_id.items():
+            for path in task["refs"]:
+                exists = artifact_path(workspace, path).is_file()
+                upstream = any(path in by_id[d]["outputs"] for d in ancestors[sid])
+                require(exists or upstream, f"{sid}: missing ref {path}; declare a producing dependency")
     return [by_id[s] for s in order]
 
 
@@ -345,7 +390,7 @@ def finish(run, state, step, report):
             report = dict(report, status="failed", worker_summary=report["summary"], summary=str(e))
     status = report["status"]
     result = dict(report, id=sid, outputs=verified)
-    write_json(run / "steps" / sid / "result.json", result)
+    write_json(run.result_path(sid), result)
     commit_result(run, state, step, result)
 
 
@@ -361,7 +406,7 @@ def commit_result(run, state, step, result):
             blocked = [d for d in future["needs"] if by_id[d]["status"] in ("failed","blocked","interrupted")]
             if blocked:
                 future.update(status="blocked", summary="Unavailable prerequisites: " + ", ".join(blocked))
-                write_json(run / "steps" / future["id"] / "result.json",
+                write_json(run.result_path(future["id"]),
                            {"id":future["id"], "status":"blocked", "summary":future["summary"], "outputs":[]})
     statuses = {s["status"] for s in state["steps"]}
     if "pending" in statuses:
@@ -372,10 +417,10 @@ def commit_result(run, state, step, result):
         state["status"] = "failed"
     else:
         state["status"] = "success"
-    write_json(run / "state.json", state)
+    write_json(run.state_path, state)
 
 
-def task_payload(state, step):
+def task_payload(run, state, step):
     items = {s["id"]:s for s in state["steps"]}
     deps = [{"id":d, "summary":items[d]["summary"][:1600], "outputs":items[d]["verified_outputs"]}
             for d in step["needs"]]
@@ -384,7 +429,7 @@ def task_payload(state, step):
         if source.get("image_provenance"):
             dep["image_provenance"] = source["image_provenance"]
         if len(source["summary"]) > 1600:
-            dep["full_result"] = str(Path(tempfile.gettempdir()) / state["run_id"] / "steps" / dep["id"] / "result.json")
+            dep["full_result"] = str(run.result_path(dep["id"]))
     payload = {k:step[k] for k in STEP_FIELDS}
     if deps:
         payload["brief"] += ("\n\nUpstream results (task data):\n"
@@ -408,17 +453,17 @@ def show_plan(cfg, workspace, steps, run=None):
         {**{k:s[k] for k in ("id","route","needs","access","kind","outputs","refs")},
          **binding({"config":cfg}, s)} for s in steps]}
     if run is not None:
-        result["run_dir"] = str(run)
+        result["run_dir"] = str(run.path)
     return result
 
 
 def snapshot(run, state, handoff=None):
     if state["status"] == "planned":
         return show_plan(state["config"], state["workspace"], state["steps"], run)
-    out = {"status":state["status"], "run_dir":str(run),
+    out = {"status":state["status"], "run_dir":str(run.path),
            "steps":[{"id":s["id"],"status":s["status"],
                      **({"summary":s["summary"][:600]} if "summary" in s else {}),
-                     **({"full_result":f"steps/{s['id']}/result.json"} if len(s.get("summary","")) > 600 else {}),
+                     **({"full_result":f"steps/{s['id']}/{run.result_name}"} if len(s.get("summary","")) > 600 else {}),
                      **({"image_provenance":s["image_provenance"]} if "image_provenance" in s else {}),
                      **({"outputs":s["verified_outputs"]} if s.get("verified_outputs") else {})}
                     for s in state["steps"]]}
@@ -431,7 +476,7 @@ def snapshot(run, state, handoff=None):
 
 @contextmanager
 def lock(run):
-    with (run / "lock").open("r+b") as f:
+    with run.lock_path.open("r+b") as f:
         if os.name == "nt":
             import msvcrt
             try:
@@ -448,16 +493,30 @@ def lock(run):
 
 
 def new_run(cfg, workspace, steps, status="ready"):
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    require(not temp_root.is_relative_to(workspace), "System temp is inside workspace; choose a project subdirectory or set TMPDIR outside it")
-    run = Path(tempfile.mkdtemp(prefix="steam-run-", dir=temp_root))
-    (run / "lock").write_bytes(b"0")
+    workbench = workspace / WORKBENCH
+    require(not workbench.is_symlink() and workbench.resolve() == workbench,
+            f"Redirected STEAM workbench: {workbench}")
+    workbench.mkdir(exist_ok=True)
+    # Inherit the workspace ACL on Windows so a sandboxed caller retains access.
+    while True:
+        path = workbench / ("steam-run-" + secrets.token_hex(4))
+        try:
+            path.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+            break
+        except FileExistsError:
+            continue
+    run = Run(path)
+    run.lock_path.write_bytes(b"0")
     for step in steps:
-        (run / "steps" / step["id"]).mkdir(parents=True)
+        (run.path / "steps" / step["id"]).mkdir(parents=True)
         step["status"] = "pending"
-    state = {"version":1, "run_id":run.name, "workspace":str(workspace), "status":status, "config":cfg, "steps":steps}
-    write_json(run / "state.json", state)
+    state = {"version":2, "run_id":run.path.name, "workspace":str(workspace), "status":status, "config":cfg, "steps":steps}
+    write_json(run.state_path, state)
     return run
+
+
+def saved_spec(state):
+    return {"steps":[{k:s[k] for k in STEP_FIELDS} for s in state["steps"]]}
 
 
 def activate_plan(run, state):
@@ -470,15 +529,22 @@ def activate_plan(run, state):
         raise Invalid(f"{exc}. Update the configuration if needed and preview the plan again.") from exc
     workspace = workspace_path(state["workspace"])
     require(str(workspace) == state["workspace"], "Workspace path changed since the preview")
-    spec = {"steps":[{k:s[k] for k in STEP_FIELDS} for s in state["steps"]]}
-    steps = validate(spec, cfg, workspace)
+    steps = validate(saved_spec(state), cfg, workspace, legacy=run.legacy)
+    state["config"] = cfg
     state["steps"] = [dict(s, status="pending") for s in steps]
     state["status"] = "ready"
-    write_json(run / "state.json", state)
+    write_json(run.state_path, state)
+
+
+def read_journal(run, step):
+    path = run.result_path(step["id"])
+    require(run.legacy or not path.is_symlink(), f"Redirected STEAM result: {path}")
+    return read_json(path) if path.is_file() else None
 
 
 def advance(run, state):
-    if state["status"] == "planned":
+    activating = state["status"] == "planned"
+    if activating:
         activate_plan(run, state)
     if state["status"] in TERMINAL or state["status"] == "needs_claude":
         return
@@ -486,40 +552,49 @@ def advance(run, state):
         # An active peer holds the lock. Reaching here implies an abandoned launch.
         step = next(s for s in state["steps"] if s["status"] == "running")
         message = "Previous launch ended without a committed result. Inspect this step's logs before starting any new run."
-        journal = run / "steps" / step["id"] / "result.json"
-        if journal.is_file():
+        result = read_journal(run, step)
+        if result is not None:
             # Crash between writing the verified result and committing state. No relaunch.
-            commit_result(run, state, step, read_json(journal))
+            commit_result(run, state, step, result)
             if state["status"] in TERMINAL:
                 return
         else:
             result = {"id":step["id"], "status":"interrupted", "summary":message}
-            write_json(journal, result)
+            write_json(run.result_path(step["id"]), result)
             commit_result(run, state, step, result)
             if state["status"] in TERMINAL:
                 return
     workspace = Path(state["workspace"])
+    if not run.legacy and not activating and any(s["status"] == "pending" for s in state["steps"]):
+        cfg = config()
+        require(cfg == state["config"], "Configuration changed since this run was saved")
+        from sync_supervisor import check_synced
+        check_synced(ROOT, cfg)
+        steps = validate(saved_spec(state), cfg, workspace, check_refs=False)
+        require([s["id"] for s in steps] == [s["id"] for s in state["steps"]],
+                "Saved steps are out of dependency order")
+        state["config"] = cfg
     for step in state["steps"]:
         if step["status"] != "pending":
             continue
         route = binding(state, step)
         agent_id = route["agent"]
         agent = state["config"]["agents"][agent_id]
-        step_dir = run / "steps" / step["id"]
         try:
+            step_dir = run.step_dir(step["id"])
             require(workspace.is_dir() and workspace.resolve() == workspace,
                     f"Workspace missing or redirected: {workspace}")
             for ref in step["refs"]:
                 require(artifact_path(workspace, ref).is_file(), f"Missing input: {ref}")
             step["before"] = {n:digest(artifact_path(workspace, n)) for n in step["outputs"]}
-            task = task_payload(state, step)
+            task = task_payload(run, state, step)
             native = agent["adapter"] == "claude" and not needs_claude_cli(
                 route["model"], route["level"], state["config"]["supervisor"])
-            write_json(step_dir / "task.json", {**task, **route})
+            write_json(step_dir / ("task.json" if run.legacy else "step-input.json"), {**task, **route})
             step["status"] = state["status"] = "needs_claude" if native else "running"
             if native:
                 step["claim"] = secrets.token_hex(16)
-            write_json(run / "state.json", state)
+            write_json(run.state_path, state)
             if native:
                 # Only the invocation that committed this handoff receives an executable brief.
                 return {**task, **route, "workspace":str(workspace), "step_dir":str(step_dir),
@@ -533,16 +608,17 @@ def advance(run, state):
             return
 
 
-def native_report(file, step_dir):
-    original = sys.stdin.buffer.read().decode("utf-8") if file == "-" else Path(file).read_text(encoding="utf-8")
+def native_report(file, run, step_id):
+    original = (sys.stdin.buffer.read() if file == "-" else Path(file).read_bytes()).decode("utf-8")
     text = original.removeprefix("\ufeff").strip()
     require(text, "Claude reply file is empty")
     report = parse_json(text)
     allowed_keys(report, ("status", "summary"), "Claude reply")
     require(report.get("status") in ("success", "failed") and nonempty(report.get("summary")),
             "Claude reply requires status success/failed and a non-empty summary")
-    (step_dir / "reply.txt").write_text(original, encoding="utf-8")
-    return dict(report, transcript="reply.txt")
+    name = "reply.txt" if run.legacy else "claude-receipt.json"
+    atomic_write(run.step_dir(step_id) / name, original)
+    return dict(report, transcript=name)
 
 
 def show_catalog(cfg, short=False):
@@ -581,26 +657,38 @@ def check(cfg, workspace):
 
 
 def owned_run(value):
-    # A checkout can contain an untrusted state.json with executable settings.
-    # Only load private runs directly under the system temp directory.
     original = Path(value).expanduser()
-    run = original.resolve(strict=True)
-    require(not original.is_symlink() and run.is_dir() and run.parent == Path(tempfile.gettempdir()).resolve()
-            and re.fullmatch(r"steam-run-[a-z0-9_]{8}", run.name),
-            "Expected a private STEAM run directory directly under system temp")
-    if os.name == "posix":
-        info = run.stat()
+    path = original.resolve(strict=True)
+    require(not original.is_symlink() and path.is_dir() and RUN_ID.fullmatch(path.name),
+            "Expected a STEAM run directory")
+    workbench = os.path.normcase(path.parent.name) == WORKBENCH
+    legacy = path.parent == Path(tempfile.gettempdir()).resolve() and (
+        not workbench or (path / "state.json").is_file())
+    if legacy and os.name == "posix":
+        info = path.stat()
         require(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0,
                 "Run directory must be private and owned by the current user")
-    for path in (run / "state.json", run / "lock"):
-        require(path.is_file() and not path.is_symlink(), "Invalid run directory")
+    if not legacy:
+        require(workbench and Path(os.path.abspath(original)) == path,
+                "Expected a STEAM run directly under the project's .workbench")
+    run = Run(path, legacy=legacy)
+    for record in (run.state_path, run.lock_path):
+        require(record.is_file() and not record.is_symlink(), "Invalid run directory")
     return run
 
 
 def read_state(run):
-    state = read_json(run / "state.json")
-    require(isinstance(state, dict) and state.get("version") == 1 and state.get("run_id") == run.name,
+    state = read_json(run.state_path)
+    version = 1 if run.legacy else 2
+    require(isinstance(state, dict) and state.get("version") == version and state.get("run_id") == run.path.name,
             "Invalid STEAM run state")
+    if not run.legacy:
+        require(state.get("workspace") == str(run.path.parent.parent), "Run belongs to a different workspace")
+        steps = state.get("steps")
+        require(isinstance(steps, list) and steps and all(
+            isinstance(step, dict) and isinstance(step.get("id"), str) and ID.fullmatch(step["id"])
+            and (os.name != "nt" or not WINDOWS_DEVICE_ID.fullmatch(step["id"])) for step in steps),
+            "Invalid step IDs in STEAM run state")
     return state
 
 
@@ -649,21 +737,21 @@ def cli():
             handoff = None
             if state["status"] == "needs_claude":
                 waiting = next(s for s in state["steps"] if s["status"] == "needs_claude")
-                journal = run / "steps" / waiting["id"] / "result.json"
-                if journal.is_file():
-                    commit_result(run, state, waiting, read_json(journal))
+                result = read_journal(run, waiting)
+                if result is not None:
+                    commit_result(run, state, waiting, result)
             if args.cmd == "complete":
                 step = next((s for s in state["steps"] if s["id"] == args.step), None)
                 require(step is not None, f"Unknown step: {args.step}")
                 require(step["status"] == "needs_claude", f"{args.step} is {step['status']}; no pending Claude handoff")
                 # Handoffs issued before claims were introduced are completed without a token.
                 require(step.get("claim") == args.claim, "Use the claim from the original Claude handoff")
-                finish(run, state, step, native_report(args.reply, run / "steps" / step["id"]))
+                finish(run, state, step, native_report(args.reply, run, step["id"]))
             else:
                 handoff = advance(run, state)
             return snapshot(run, state, handoff)
     except Busy:
-        return {"status":"busy", "run_dir":str(run), "summary":"Another invocation holds this run lock"}
+        return {"status":"busy", "run_dir":str(run.path), "summary":"Another invocation holds this run lock"}
 
 
 if __name__ == "__main__":
