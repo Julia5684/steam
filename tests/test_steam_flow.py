@@ -123,6 +123,158 @@ class ConcurrentFlowTests(unittest.TestCase):
             self.assertTrue(flow.query_result(run)["recovery_required"])
             self.assertEqual(flow.concurrent_advance(run, step_id="a")["status"], "success")
 
+    def test_implicit_recovery_persists_interrupted_receipt_and_blocks_dependents(self):
+        run = self.run_for([self.row("a"), self.row("dependent", needs=["a"])])
+        state = flow.read_state(run)
+        state["steps"][0].update(status="running", started_at=flow.timestamp())
+        flow.refresh_status(state)
+        flow.write_json(run.state_path, state)
+        with self.workers(lambda *a, **k: self.fail("must not redispatch")):
+            result = flow.concurrent_advance(run, one_step=True)
+            self.assertEqual(result["status"], "interrupted")
+            self.assertEqual(flow.read_json(run.result_path("a"))["status"], "interrupted")
+            self.assertEqual(flow.read_json(run.result_path("dependent"))["status"], "blocked")
+            receipt = run.result_path("a").read_bytes()
+            self.assertEqual(flow.concurrent_advance(run)["status"], "interrupted")
+            self.assertEqual(run.result_path("a").read_bytes(), receipt)
+
+    def test_implicit_recovery_skips_active_lease(self):
+        run = self.run_for([self.row("active"), self.row("stale")])
+        state = flow.read_state(run)
+        for step in state["steps"]:
+            step.update(status="running", started_at=flow.timestamp())
+        flow.refresh_status(state)
+        flow.write_json(run.state_path, state)
+        with self.workers(lambda *a, **k: self.fail("must not redispatch")):
+            with flow.lock(run, step_id="active"):
+                result = flow.concurrent_advance(run, one_step=True)
+                self.assertEqual([s["status"] for s in result["steps"]], ["running", "interrupted"])
+                self.assertFalse(run.result_path("active").exists())
+                again = flow.concurrent_advance(run, one_step=True)
+                self.assertEqual(again["steps"][0]["status"], "running")
+                self.assertEqual(flow.query_result(run)["active_steps"], ["active"])
+
+    def test_implicit_recovery_commits_native_saved_receipt(self):
+        run = self.run_for([self.row("native", "documentation"), self.row("dependent", needs=["native"])])
+        with self.workers(lambda *a, **k: self.fail("must not dispatch")):
+            handoff = flow.concurrent_advance(run, one_step=True, step_id="native")
+            flow.write_json(run.result_path("native"), {
+                "id":"native", "status":"success", "summary":"saved native result", "outputs":[],
+                "finished_at":flow.timestamp()})
+            result = flow.concurrent_advance(run, one_step=True)
+            self.assertEqual(result["steps"][0]["status"], "success")
+            self.assertEqual(result["ready_steps"], ["dependent"])
+            self.assertEqual(flow.read_state(run)["steps"][0]["claim"], handoff["next"]["claim"])
+
+    def test_implicit_continue_skips_native_handoff_without_receipt(self):
+        run = self.run_for([self.row("native", "documentation"), self.row("external")])
+        with self.workers(lambda *a, **k: {"status":"success", "summary":"done"}):
+            flow.concurrent_advance(run, one_step=True, step_id="native")
+            result = flow.concurrent_advance(run, one_step=True)
+            self.assertEqual([s["status"] for s in result["steps"]], ["needs_claude", "success"])
+
+    def test_implicit_continue_drains_recovery_and_ready_work_then_waits_for_native(self):
+        run = self.run_for([self.row("saved"), self.row("stale"),
+                            self.row("blocked", needs=["stale"]), self.row("ready", needs=["saved"]),
+                            self.row("native", "documentation")])
+        calls = []
+        def worker(*args, **kwargs):
+            calls.append(args[6].name)
+            return {"status":"success", "summary":"done"}
+
+        with self.workers(worker):
+            flow.concurrent_advance(run, one_step=True, step_id="native")
+            state = flow.read_state(run)
+            for step in state["steps"][:2]:
+                step.update(status="running", started_at=flow.timestamp())
+            flow.refresh_status(state)
+            flow.write_json(run.state_path, state)
+            flow.write_json(run.result_path("saved"), {
+                "id":"saved", "status":"success", "summary":"saved result", "outputs":[],
+                "finished_at":flow.timestamp()})
+            result = flow.concurrent_advance(run)
+            self.assertEqual([s["status"] for s in result["steps"]],
+                             ["success", "interrupted", "blocked", "success", "needs_claude"])
+            self.assertEqual(result["status"], "waiting_claude")
+            self.assertEqual(calls, ["ready"])
+            self.assertEqual(flow.concurrent_advance(run)["status"], "waiting_claude")
+            self.assertEqual(calls, ["ready"])
+
+    def test_implicit_continue_recovers_native_receipt_and_runs_dependents(self):
+        run = self.run_for([self.row("native", "documentation"), self.row("dependent", needs=["native"])])
+        with self.workers(lambda *a, **k: {"status":"success", "summary":"done"}):
+            flow.concurrent_advance(run, one_step=True, step_id="native")
+            flow.write_json(run.result_path("native"), {
+                "id":"native", "status":"success", "summary":"saved native result", "outputs":[],
+                "finished_at":flow.timestamp()})
+            result = flow.concurrent_advance(run)
+            self.assertEqual(result["status"], "success")
+            self.assertEqual([s["status"] for s in result["steps"]], ["success", "success"])
+
+    def test_implicit_continue_drains_recovery_and_ready_work_while_other_step_is_active(self):
+        run = self.run_for([self.row("active"), self.row("stale"), self.row("ready")])
+        state = flow.read_state(run)
+        for step in state["steps"][:2]:
+            step.update(status="running", started_at=flow.timestamp())
+        flow.refresh_status(state)
+        flow.write_json(run.state_path, state)
+        with self.workers(lambda *a, **k: {"status":"success", "summary":"done"}):
+            with flow.lock(run, step_id="active"):
+                result = flow.concurrent_advance(run)
+                self.assertEqual([s["status"] for s in result["steps"]], ["running", "interrupted", "success"])
+                self.assertFalse(run.result_path("active").exists())
+                self.assertEqual(flow.query_result(run)["active_steps"], ["active"])
+
+    def test_state_wait_ignores_activity_until_status_changes(self):
+        running = {"execution_active":True, "steps":[{"id":"a", "status":"running", "activity":"first"}]}
+        activity = copy.deepcopy(running)
+        activity["steps"][0]["activity"] = "second"
+        finished = {"execution_active":False, "steps":[{"id":"a", "status":"success"}]}
+        with patch.object(flow, "query_result", side_effect=[running, activity, finished]), \
+             patch.object(flow.time, "sleep") as sleep:
+            self.assertEqual(flow.wait_result(None, 1, "state"), finished)
+            self.assertEqual(sleep.call_count, 2)
+        with patch.object(flow, "query_result", side_effect=[running, activity]), \
+             patch.object(flow.time, "sleep") as sleep:
+            self.assertEqual(flow.wait_result(None, 1), activity)
+            self.assertEqual(sleep.call_count, 1)
+
+    def test_state_wait_returns_when_recovery_needs_attention_while_another_step_is_active(self):
+        running = {"execution_active":True, "recovery_required":False, "steps":[
+            {"id":"active", "status":"running"}, {"id":"stale", "status":"running"}]}
+        recovery = dict(running, recovery_required=True, recovery_steps=["stale"])
+        with patch.object(flow, "query_result", side_effect=[running, recovery]), \
+             patch.object(flow.time, "sleep") as sleep:
+            self.assertEqual(flow.wait_result(None, 60, "state"), recovery)
+            self.assertEqual(sleep.call_count, 1)
+        with patch.object(flow, "query_result", return_value=recovery), \
+             patch.object(flow.time, "sleep") as sleep:
+            self.assertEqual(flow.wait_result(None, 60, "state"), recovery)
+            sleep.assert_not_called()
+        activity = copy.deepcopy(recovery)
+        activity["steps"][0]["activity"] = "new activity"
+        with patch.object(flow, "query_result", side_effect=[recovery, activity]), \
+             patch.object(flow.time, "sleep") as sleep:
+            self.assertEqual(flow.wait_result(None, 60), activity)
+            self.assertEqual(sleep.call_count, 1)
+
+    def test_result_cli_passes_wait_mode(self):
+        with patch.object(sys, "argv", ["flow.py", "result", "--run-dir", "saved", "--wait", "60",
+                                        "--wait-for", "state"]), \
+             patch.object(flow, "owned_run", return_value="run"), \
+             patch.object(flow, "wait_result", return_value={"status":"running"}) as wait:
+            self.assertEqual(flow.cli(), {"status":"running"})
+            wait.assert_called_once_with("run", 60, "state")
+
+    def test_plan_marks_truncated_brief_without_changing_saved_input(self):
+        row = dict(self.row("a"), brief="x" * 606)
+        run = self.run_for([row])
+        state = flow.read_state(run)
+        result = flow.show_plan(self.cfg, self.workspace, state["steps"], run)
+        self.assertTrue(result["steps"][0]["brief_truncated"])
+        self.assertEqual(len(result["steps"][0]["brief"]), 600)
+        self.assertEqual(state["steps"][0]["brief"], row["brief"])
+
     def test_revision_preserves_success_and_archives_explicit_retry(self):
         run = self.run_for([self.row("done"), self.row("bad")])
         def worker(*args, **kwargs):

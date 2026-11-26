@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "supervisor": { "agent": "claude", "model": "opus", "level": "high" },
+  "supervisor": { "agent": "claude", "model": "inherit", "level": "inherit" },
   "agents": {
     "claude": {
       "enabled": true,

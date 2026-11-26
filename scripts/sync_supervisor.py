@@ -21,14 +21,15 @@ def desired_text(root, config):
             agent.get("enabled", True)
             and agent["adapter"] == "claude"
             and isinstance(model, str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", model)
-            and level in agent["models"][model]
-            and level in {"low", "medium", "high", "xhigh", "max"}
+            and (model == "inherit" or model in agent["models"]
+                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", model))
+            and (level == "inherit" or level in {"low", "medium", "high", "xhigh", "max"})
+            and (model == "inherit" or level == "inherit" or level in agent["models"][model])
         )
     except (KeyError, TypeError) as exc:
         raise ValueError("请检查 config.json 的 supervisor 和 agents 配置。") from exc
     if not valid:
-        raise ValueError("主管需要已启用的 Claude 执行器、已列出的模型和可用等级。")
+        raise ValueError("主管需要已启用的 Claude 执行器。模型和等级可填 inherit，固定值须在配置中可用。")
 
     src = (root / "SKILL.md").read_text(encoding="utf-8")
     sections = src.split("---\n", 2)
@@ -36,9 +37,15 @@ def desired_text(root, config):
         raise ValueError("SKILL.md 缺少 Claude 技能所需的文件头。")
     header = sections[1]
     for key, value in (("model", model), ("effort", level)):
-        header, matches = re.subn(rf"^{key}: [^\n]+$", f"{key}: {value}", header, flags=re.M)
-        if matches != 1:
-            raise ValueError(f"SKILL.md 文件头内需要一个 {key} 字段。")
+        pattern = rf"^{key}:[^\n]*\n?"
+        matches = len(re.findall(pattern, header, flags=re.M))
+        if matches > 1:
+            raise ValueError(f"SKILL.md 文件头内最多允许一个 {key} 字段。")
+        replacement = "" if key == "effort" and value == "inherit" else f"{key}: {value}\n"
+        if matches:
+            header = re.sub(pattern, lambda match: replacement, header, flags=re.M)
+        elif replacement:
+            header = header.rstrip("\n") + "\n" + replacement
     return src, "---\n" + header + "---\n" + sections[2]
 
 

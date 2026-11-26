@@ -185,10 +185,16 @@ def config():
 
     supervisor = data.get("supervisor")
     allowed_keys(supervisor, ("agent","model","level"), "supervisor")
-    binding("supervisor", supervisor)
-    primary = agents[supervisor["agent"]]
-    require(primary["adapter"] == "claude" and primary.get("enabled", True),
+    primary = agents.get(supervisor.get("agent"), {})
+    require(primary.get("adapter") == "claude" and primary.get("enabled", True),
             "supervisor must use an enabled Claude agent")
+    model, level = supervisor.get("model"), supervisor.get("level")
+    require(nonempty(model) and (model == "inherit" or model in primary["models"]),
+            "supervisor.model must be inherit or a configured Claude model")
+    require(nonempty(level) and (level == "inherit" or level in {"low", "medium", "high", "xhigh", "max"}),
+            "supervisor.level must be inherit or a Claude effort level")
+    if model != "inherit" and level != "inherit":
+        binding("supervisor", supervisor)
     for name, route in routes.items():
         allowed_keys(route, ("description","agent","model","level"), f"route {name}")
         require(nonempty(name) and isinstance(route.get("description", ""), str),
@@ -519,6 +525,7 @@ def describe_step(cfg, step):
     route = binding(cfg, step)
     return {**{k:step[k] for k in ("id","route","needs","access","kind","refs")},
             "brief":step["brief"][:600], "status":step.get("status", "pending"),
+            **({"brief_truncated":True} if len(step["brief"]) > 600 else {}),
             "dispatch":"native" if native_step(cfg, route) else "cli", **route, **timing(step)}
 
 
@@ -627,15 +634,21 @@ def query_result(run):
     return {**out, "execution_active":active, "recovery_required":recover}
 
 
-def wait_result(run, seconds):
+def wait_result(run, seconds, wait_for="activity"):
+    include_activity = wait_for == "activity"
+    def signature(snapshot):
+        return [(s["id"], s["status"], s.get("activity") if include_activity else None)
+                for s in snapshot["steps"]]
+
     result = query_result(run)
-    signature = [(s["id"], s["status"], s.get("activity")) for s in result["steps"]]
+    initial = signature(result)
     deadline = time.monotonic() + seconds
     while result["execution_active"] and time.monotonic() < deadline:
+        if wait_for == "state" and result.get("recovery_required"):
+            break
         time.sleep(min(0.25, max(0, deadline - time.monotonic())))
         result = query_result(run)
-        current = [(s["id"], s["status"], s.get("activity")) for s in result["steps"]]
-        if current != signature:
+        if signature(result) != initial:
             break
     return result
 
@@ -711,9 +724,12 @@ def compatible_config(state):
     saved = state["config"]
     if current == saved:
         return current
-    # Only migrate the two historical AGY defaults, and only when none of this
-    # run's actual bindings change. All other configuration drift is rejected.
+    # Migrate historical defaults only when this run keeps its actual bindings
+    # and native/CLI dispatch. All other configuration drift is rejected.
     normalized = copy.deepcopy(saved)
+    if (normalized.get("supervisor") == {"agent":"claude", "model":"opus", "level":"high"}
+            and current.get("supervisor") == {"agent":"claude", "model":"inherit", "level":"inherit"}):
+        normalized["supervisor"] = copy.deepcopy(current["supervisor"])
     models = normalized.get("agents", {}).get("antigravity", {}).get("models", {})
     for model, old_level in (("gemini-pro-orchestrator", "medium"),
                              ("gemini-pro-orchestrator-neon", "high")):
@@ -725,7 +741,9 @@ def compatible_config(state):
         if (route.get("agent"), route.get("model"), route.get("level")) == ("antigravity", model, old_level):
             route["level"] = "default"
     require(normalized == current and
-            all(binding(saved, step) == binding(current, step) for step in state["steps"]),
+            all(binding(saved, step) == binding(current, step)
+                and native_step(saved, binding(saved, step)) == native_step(current, binding(current, step))
+                for step in state["steps"]),
             "Configuration changed since this run was saved; preview the affected plan again")
     return current
 
@@ -846,19 +864,31 @@ def concurrent_advance(run, *, one_step=False, step_id=None, stream=False, expec
             if step_id:
                 step = next((s for s in state["steps"] if s["id"] == step_id), None)
                 require(step is not None, f"Unknown step: {step_id}")
+                candidates = [step]
             else:
                 completed = {s["id"] for s in state["steps"] if s["status"] == "success"}
-                step = next((s for s in state["steps"] if s["status"] == "pending" and
-                             set(s["needs"]) <= completed), None)
+                candidates = [s for s in state["steps"] if s["status"] == "running" or
+                              s["status"] == "needs_claude" and run.result_path(s["id"]).is_file()]
+                candidates += [s for s in state["steps"] if s["status"] == "pending" and
+                               set(s["needs"]) <= completed]
+            step = None
+            for candidate in candidates:
+                route = binding(state["config"], candidate)
+                require(expected_agent is None or route["agent"] == expected_agent,
+                        f"{candidate['id']}: expected agent {expected_agent}, saved agent is {route['agent']}")
+                if candidate["status"] in STEP_TERMINAL:
+                    return snapshot(run, state)
+                lease = lock(run, step_id=candidate["id"])
+                try:
+                    lease.__enter__()
+                except Busy:
+                    if step_id:
+                        raise
+                    continue
+                step = candidate
+                break
             if step is None:
                 return snapshot(run, state)
-            route = binding(state["config"], step)
-            require(expected_agent is None or route["agent"] == expected_agent,
-                    f"{step['id']}: expected agent {expected_agent}, saved agent is {route['agent']}")
-            if step["status"] in STEP_TERMINAL:
-                return snapshot(run, state)
-            lease = lock(run, step_id=step["id"])
-            lease.__enter__()
         try:
             with state_lock(run):
                 state = read_state(run)
@@ -868,11 +898,15 @@ def concurrent_advance(run, *, one_step=False, step_id=None, stream=False, expec
                     if journal:
                         commit_result(run, state, step, journal)
                     elif step["status"] == "running":
-                        commit_result(run, state, step, {
+                        result = {
                             "id":step["id"], "status":"interrupted", "outputs":[],
-                            "summary":"Previous launch ended without a committed result. Inspect its logs before retrying.",
-                            "interrupted_at":timestamp()})
-                    return snapshot(run, state)
+                            "summary":"Launcher exited without a receipt. Confirm the worker has stopped and inspect its outputs before retrying.",
+                            "interrupted_at":timestamp()}
+                        write_json(run.result_path(step["id"]), result)
+                        commit_result(run, state, step, result)
+                    if one_step or step_id or state["status"] in TERMINAL or step["status"] == "needs_claude":
+                        return snapshot(run, state)
+                    continue
                 if step["status"] in STEP_TERMINAL:
                     return snapshot(run, state)
                 ready = {s["id"] for s in state["steps"] if s["status"] == "success"}
@@ -1189,6 +1223,8 @@ def cli():
         if name == "result":
             c.add_argument("--wait", type=float, default=0, metavar="SECONDS",
                            help="Wait up to 60 seconds for new activity or a state change")
+            c.add_argument("--wait-for", choices=("activity", "state"), default="activity",
+                           help="Choose whether public activity also ends the wait (default: activity)")
         if name == "complete":
             c.add_argument("--step", required=True)
             c.add_argument("--claim", help="Claim from the original Claude handoff")
@@ -1219,7 +1255,7 @@ def cli():
         run = owned_run(args.run_dir)
     if args.cmd == "result":
         require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
-        return wait_result(run, args.wait)
+        return wait_result(run, args.wait, args.wait_for)
     if args.cmd == "revise":
         spec = parse_json(sys.stdin.buffer.read().decode("utf-8-sig")) if args.spec == "-" else read_json(args.spec)
         return revise(run, spec)

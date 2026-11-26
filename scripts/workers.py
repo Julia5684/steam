@@ -553,9 +553,9 @@ def _run_codex(command, model, level, task, workspace, step_dir, timeout, progre
             "-c", "model_reasoning_effort=" + json.dumps(level)]
     if image_job:
         args += ["-c", "features.image_generation=true"]
-        for ref in task.get("refs", []):
-            if Path(ref).suffix.lower() in {".png", ".webp", ".jpg", ".jpeg", ".gif"}:
-                args += ["--image", str((workspace / ref).resolve())]
+    for ref in task.get("refs", []):
+        if Path(ref).suffix.lower() in {".png", ".webp", ".jpg", ".jpeg", ".gif"}:
+            args += ["--image", str((workspace / ref).resolve())]
     state = {"thread": "", "body": "", "ended": False, "error": "", "image_event": False}
     def event(e):
         _codex_progress(progress, e)
