@@ -1,10 +1,10 @@
 # /steam 多 Agent 协作
 
-在 Claude Code Desktop 的本地 Code 会话里，输入 `/steam 任务` 即可派工。平时继续正常使用 Claude。Claude 负责分析意图、选择任务类型，以及承担配置分给它的工作。Python 脚本负责执行顺序、模型参数、结果记录和文件检查。
+在 Claude Code Desktop 输入 `/steam 任务` 即可。Claude 在主聊天分工，把每个外部步骤交给一个内置子 Agent，由它运行本机已登录的 Codex 或 Antigravity CLI。你可以点开每个子 Agent 看它在做什么。主管等所有必需步骤交回结果后，在主聊天里统一答复。
 
 Steam 默认只接受手动调用。Claude Code 使用 `/steam`，Codex 使用 `$steam`。Codex 可以检查环境、预览计划、查询结果，以及执行仅含 Codex 和 Antigravity 步骤的任务。包含 Claude 步骤的计划可以在 Claude Code 中执行或继续。
 
-## 安装
+## 技能与运行环境
 
 准备 Python 3.10 或更新版，以及准备使用的官方 CLI。默认的文档写作和界面动画设计在 Claude Code 会话中执行。需要脚本派发的固定型号 Claude 任务还需本机已登录的 Claude Code CLI（`claude`）。Codex 通过 `codex login` 选择 ChatGPT 账号，Antigravity 使用有相应权益的 Google 个人账号登录 `agy`。首次登录和项目授权在对应客户端完成。各 CLI 可通过当前会话的 PATH 或配置中的可执行文件绝对路径定位。Python 只用标准库。
 
@@ -17,7 +17,7 @@ Steam 默认只接受手动调用。Claude Code 使用 `/steam`，Codex 使用 `
 | Windows 上的 WSL 会话 | 对应 Linux 发行版中的 `~/.claude/skills/steam/`，Python 和 CLI 也从该环境启动 |
 | Codex | Windows 的 `%USERPROFILE%\.agents\skills\steam\`，macOS / Linux / WSL 的 `~/.agents/skills/steam/` |
 
-若已安装旧 `/crew` 且只想保留一个入口，可把旧 `crew` 文件夹移到 `skills` 目录以外作备份。新技能首次未出现在菜单中时，可新开本地 Code 会话。安装不需要常驻服务或项目级配置。
+个人技能目录可以直接链接到这份仓库，各项目共用同一个 `/steam`。新技能首次未出现在菜单中时，可新开本地 Code 会话。
 
 ## 使用
 
@@ -54,24 +54,24 @@ python3 ~/.claude/skills/steam/scripts/flow.py check --workspace .
 
 ### 在 Desktop 看子任务怎么执行
 
-例如输入 `/steam 分析当前项目`，主管会派发「分析项目结构 · Codex」。点开该 Agent 的工具输出可看 Codex 执行期间发出的公开说明、工具活动和结果摘要。Antigravity 的工具调用与公开输出也经过同一条通道。各 CLI 暴露的事件不同，有新事件时才会更新。Desktop 将 Agent 放到后台时，也可从 **Background tasks** 点开对应任务。[Claude Desktop 任务面板](https://code.claude.com/docs/en/desktop#watch-background-tasks)
+例如输入 `/steam 分析当前项目`，右栏可以出现「分析项目结构 · Codex」。这是普通的 Claude 子 Agent，标题标明实际执行工作的 CLI。在 **Background tasks** 点开条目，可以看到子 Agent 的简报、Bash 调用和工具输出。CLI 通过命令报告公开进展，显示时机会随 Desktop 的工具视图而异。[Claude Desktop 任务面板](https://code.claude.com/docs/en/desktop#watch-background-tasks)
 
-主聊天保留关键进展。步骤结束后，主管读取回执，把分析结论、改动或产物直接交给你。多步任务会接着推进剩余步骤，最后显示完成数和总耗时；失败或中断时列出原因及受影响的步骤。旧运行可以继续查询已有回执。
+主聊天报告关键发现和阻塞。只有所有必需步骤都已成功验收、结果已汇总交付，主管才报告全部完成。部分失败时推进不受影响的工作，核实已有产物后才能重试。用户停止的任务等待进一步指示。
 
-Claude Code 每派发一个外部步骤，就用一个原生子 Agent 展示执行过程，这部分计入 Claude 会话用量。分析或修改由路由配置的 Codex、Antigravity 或专项 Claude CLI 执行。Codex 客户端和缺少原生 Agent 工具的环境直接在前台命令中显示同一份事件流。
+Claude 主管和调用 CLI 的原生子 Agent 都会使用 Claude 额度。子 Agent 只启动指定步骤、等待并交回简短结果。业务推理使用该步骤选定的 Codex 或 Antigravity 模型，计入对应账号。
 
 本次命令可附上相关日志、截图或参数的项目内路径。只要求界面动画设计时，`motion_ux` 交付时间线、可交互时刻和中断行为。同时要求接入工程时，`integration` 接续设计结果。
 
-## 唯一需要维护的配置
+## 可选的路由与模型配置
 
-编辑安装目录的 **`config.json`**。它是 UTF-8 标准 JSON。
+默认分工可以直接使用。要定制路由、模型或步数上限时，编辑技能目录中的 **`config.json`**，所有项目共用这份配置。
 
 | 配置项 | 管什么 |
 | --- | --- |
 | `agents.<名称>.enabled` | 该执行器是否参与派工。例如暂时停用 Antigravity 可改成 `false`。指向该执行器的任务需改派或重新启用。 |
 | `agents.<名称>.models` | 允许该执行器用的模型，以及每个模型允许的推理等级。填写你账号实际可用且愿意使用的组合。 |
 | `agents.<名称>.executable` | 本机 CLI 的命令名或原生可执行文件的绝对路径。Claude 的固定版本专项任务使用此项，主管由 Desktop 会话启动。 |
-| `routes.<任务类型>` | 每类任务的说明、默认执行器 `agent`、模型 `model`、等级 `level`。修改分工时改这一行。 |
+| `routes.<任务类型>` | 每类任务的默认执行器、模型和等级。主管可为单项工作一起指定目录内的 `agent`、`model`、`level`，并解释原因。能力相当时优先 Codex，再考虑 Antigravity 和 Claude。 |
 | `limits.max_calls` / `max_steps` | 每项任务允许的派工步数。预检一次性检查整张计划。每个步骤内部可有多轮工具操作。这两项限制步数，订阅消耗取决于各产品的计量方式。 |
 | `supervisor` | 主管自身的模型和等级。保持 `agent` 指向 Claude。 |
 
@@ -86,7 +86,7 @@ Claude Code 每派发一个外部步骤，就用一个原生子 Agent 展示执�
 }
 ```
 
-任务路由、模型清单和派工上限在下次新任务生效。项目内运行派发待执行步骤前，会核对本机配置与保存的快照完全一致，配置变化后需重新预览。状态查询及已领取步骤的回执提交仍可进行。旧版临时目录中的运行沿用启动时保存的配置。默认每项任务最多 8 步，Codex 最多 5 步，Antigravity 最多 1 步，Claude 专项工作最多 2 步。主管本身的派工和汇总另计。若需要把不同模型的两项工作都交给 Antigravity，例如粒子制作加性能归因，可在发任务前将这一上限改为 2。
+任务路由、模型清单和派工上限在下次新任务生效。派发前会核对本机配置与保存的快照。配置变化后，先核对已交付和仍待处理的工作，再用新配置预览剩余步骤。默认整项最多 8 步，每个计划的 Codex、Antigravity、Claude 分别最多 5、2、2 步；这些上限不计量实际订阅余额。主管的派工和汇总另计。
 
 **仅当更改主管模型或等级时**，在安装好的 `steam` 目录运行一次同步。Claude Code 在加载技能正文前从文件头读取这两个字段；脚本只同步这两个值。若忘记同步，执行器会提示。其他配置直接编辑 JSON 即可。
 
@@ -111,7 +111,7 @@ Antigravity 按 `agy models` 返回的目录选择型号和档位。使用 Orche
 ```text
 .workbench/<task_id>/
 ├── run-state.json             # 计划、配置快照和步骤状态
-├── run.lock                   # 防止同一次运行被并发推进
+├── run.lock                   # 保护计划和共享状态更新
 └── steps/<步骤ID>/
     ├── step-input.json        # 步骤简报、执行器配置和上游依赖
     ├── step-result.json       # 完整结果和已验证的产物路径
@@ -122,7 +122,7 @@ Antigravity 按 `agy models` 返回的目录选择型号和档位。使用 Orche
     └── claude-receipt.json    # Claude 原生步骤的原始 JSON 回执
 ```
 
-保存计划时先创建运行状态和步骤目录，各步骤文件随执行生成。外部执行器将近期活动和有大小上限的 CLI 日志写入步骤目录，Claude 原生步骤保存回执。在终端用 `continue --one-step --step "<ID>" --stream --run-dir "<目录>"` 可查看实时活动。该命令向 stderr 输出进度，stdout 保留一个结果 JSON。`result --run-dir "<目录>" --wait 30` 在外部步骤运行时最多等 30 秒，活动或状态变化时提前返回。续跑时会校验运行目录所属项目及保存的计划，并使用本机安装目录的配置派发。旧版系统临时目录的运行仍支持原路径的查询、续跑和回执提交。
+保存计划时先创建运行状态和步骤目录。新运行按步骤单独领取；同一 ID 的并发调用跟踪已有工作。终端用 `continue --one-step --step "<ID>" --stream --run-dir "<目录>"` 可查看实时活动，stderr 输出进度，stdout 保留结果 JSON。`result --run-dir "<目录>" --wait 60` 分段等待状态或活动变化。`revise --run-dir "<目录>" --spec "<计划文件>"` 可替换尚未开始的分工；显式重试时在文件的 `retry` 中列出 ID，保留先前回执。旧运行继续使用保存的执行方式。
 
 Claude Code 会将计划和回执的输入 JSON 写到项目的 `.workbench/steam-inputs/`。每份输入使用独立文件名，Shell 命令只传文件路径。使用 Git 的项目可在自己的 `.gitignore` 中加入 `/.workbench/steam-run-*/` 和 `/.workbench/steam-inputs/`。任务结束后可按需归档或删除这些记录。
 

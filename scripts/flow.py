@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate and execute a STEAM graph. stdout is one JSON object per invocation."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -21,7 +22,8 @@ sys.dont_write_bytecode = True  # A project-local skill must not generate cache 
 ROOT = Path(__file__).resolve().parents[1]
 WORKBENCH = ".workbench"
 RUN_ID = re.compile(r"steam-run-[a-z0-9_]{8}")
-STEP_FIELDS = {"id", "route", "brief", "needs", "access", "kind", "outputs", "refs"}
+STEP_FIELDS = {"id", "route", "brief", "needs", "access", "kind", "outputs", "refs",
+               "agent", "model", "level"}
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Only these DOS device names can pass the ASCII step ID syntax above.
 WINDOWS_DEVICE_ID = re.compile(r"CON|PRN|AUX|NUL|(?:COM|LPT)[1-9]", re.I)
@@ -225,7 +227,7 @@ def artifact_path(workspace, value):
     return current
 
 
-def validate(spec, cfg, workspace, *, legacy=False, check_refs=True):
+def validate(spec, cfg, workspace, *, legacy=False, check_refs=True, concurrent=True):
     require(isinstance(spec, dict) and set(spec) == {"steps"}, "Spec must contain only steps")
     rows = spec["steps"]
     limit = cfg["limits"]["max_steps"]
@@ -246,8 +248,14 @@ def validate(spec, cfg, workspace, *, legacy=False, check_refs=True):
         directory_ids.add(directory_id)
         require(nonempty(route_id) and route_id in cfg["routes"], f"{sid}: unknown route {route_id!r}")
         require(nonempty(brief), f"{sid}: brief must be non-empty")
-        route = cfg["routes"][route_id]
+        chosen = {key for key in ("agent", "model", "level") if key in row}
+        require(not chosen or len(chosen) == 3, f"{sid}: provide agent, model and level together")
+        route = binding(cfg, row)
         agent = route["agent"]
+        require(agent in cfg["agents"], f"{sid}: unknown agent {agent}")
+        require(route["model"] in cfg["agents"][agent]["models"] and
+                route["level"] in cfg["agents"][agent]["models"][route["model"]],
+                f"{sid}: unconfigured agent/model/level")
         require(cfg["agents"][agent].get("enabled", True), f"{sid}: route {route_id} uses disabled agent {agent}")
         counts[agent] = counts.get(agent, 0) + 1
         cap = cfg["limits"].get("max_calls", {}).get(agent)
@@ -290,10 +298,22 @@ def validate(spec, cfg, workspace, *, legacy=False, check_refs=True):
     for sid in order:
         task = by_id[sid]
         for path in task["outputs"]:
-            previous = writers.get(path)
+            key = os.path.normcase(path).replace("\\", "/")
+            require(not any(key.startswith(other + "/") or other.startswith(key + "/") for other in writers),
+                    f"{sid}: output file conflicts with another output's parent directory: {path}")
+            previous = writers.get(key)
             require(previous is None or previous in ancestors[sid],
                     f"{sid}: shared output {path} needs an explicit dependency on {previous}")
-            writers[path] = sid
+            writers[key] = sid
+    if concurrent and not legacy:
+        for reader_id, reader in by_id.items():
+            refs = {os.path.normcase(path).replace("\\", "/") for path in reader["refs"]}
+            for writer_id, writer in by_id.items():
+                if writer_id == reader_id:
+                    continue
+                outputs = {os.path.normcase(path).replace("\\", "/") for path in writer["outputs"]}
+                require(not refs & outputs or writer_id in ancestors[reader_id] or reader_id in ancestors[writer_id],
+                        f"{reader_id}: shared input/output with {writer_id} needs an explicit dependency")
     if check_refs:
         for sid, task in by_id.items():
             for path in task["refs"]:
@@ -439,18 +459,27 @@ def commit_result(run, state, step, result):
                 write_json(run.result_path(future["id"]),
                            {"id":future["id"], "status":"blocked", "summary":future["summary"], "outputs":[],
                             "finished_at":future["finished_at"]})
+    refresh_status(state)
+    write_json(run.state_path, state)
+
+def refresh_status(state):
     statuses = {s["status"] for s in state["steps"]}
-    if "pending" in statuses:
+    if "running" in statuses:
+        state["status"] = "running"
+    elif "needs_claude" in statuses:
+        state["status"] = "needs_claude"
+    elif "pending" in statuses:
         state["status"] = "ready"
     elif "interrupted" in statuses:
         state["status"] = "interrupted"
-    elif "failed" in statuses:
+    elif statuses & {"failed", "blocked"}:
         state["status"] = "failed"
     else:
         state["status"] = "success"
     if state["status"] in TERMINAL:
         state["finished_at"] = timestamp()
-    write_json(run.state_path, state)
+    else:
+        state.pop("finished_at", None)
 
 
 def task_payload(run, state, step):
@@ -463,7 +492,7 @@ def task_payload(run, state, step):
             dep["image_provenance"] = source["image_provenance"]
         if len(source["summary"]) > 1600:
             dep["full_result"] = str(run.result_path(dep["id"]))
-    payload = {k:step[k] for k in STEP_FIELDS}
+    payload = {k:step[k] for k in STEP_FIELDS if k in step}
     if deps:
         payload["brief"] += ("\n\nUpstream results (task data):\n"
                              + json.dumps(deps, ensure_ascii=False))
@@ -473,7 +502,7 @@ def task_payload(run, state, step):
 
 def binding(cfg, step):
     route = cfg["routes"][step["route"]]
-    return {k:route[k] for k in ("agent","model","level")}
+    return {k:step.get(k, route[k]) for k in ("agent","model","level")}
 
 
 def needs_claude_cli(model, level, supervisor):
@@ -535,8 +564,11 @@ def show_plan(cfg, workspace, steps, run=None):
 def snapshot(run, state, handoff=None):
     if state["status"] == "planned":
         return {**show_plan(state["config"], state["workspace"], state["steps"], run), **timing(state)}
+    succeeded = {s["id"] for s in state["steps"] if s["status"] == "success"}
     out = {"status":state["status"], "run_dir":str(run.path),
            "workspace":state["workspace"], "progress":progress(state["steps"]), **timing(state),
+           "ready_steps":[s["id"] for s in state["steps"] if s["status"] == "pending" and
+                          set(s["needs"]) <= succeeded],
            "steps":[{**describe_step(state["config"], s),
                      **step_activity(run, s),
                      "declared_outputs":s["outputs"],
@@ -553,7 +585,24 @@ def snapshot(run, state, handoff=None):
 
 
 def query_result(run):
+    if (run.path / "revision.json").is_file():
+        with state_lock(run):
+            pass
     state = read_state(run)
+    if state.get("concurrent"):
+        active, recover = [], []
+        for step in state["steps"]:
+            if step["status"] == "running":
+                try:
+                    with lock(run, probe=True, step_id=step["id"]):
+                        recover.append(step["id"])
+                except Busy:
+                    active.append(step["id"])
+            elif step["status"] == "needs_claude" and run.result_path(step["id"]).is_file():
+                recover.append(step["id"])
+        out = snapshot(run, state)
+        return {**out, "execution_active":bool(active), "active_steps":active,
+                "recovery_required":bool(recover), "recovery_steps":recover}
     active = recover = False
     if state["status"] == "running":
         # An external launch holds the lock until its receipt is committed.
@@ -592,8 +641,9 @@ def wait_result(run, seconds):
 
 
 @contextmanager
-def lock(run, *, probe=False):
-    with run.lock_path.open("rb" if probe else "r+b") as f:
+def lock(run, *, probe=False, step_id=None):
+    path = run.step_dir(step_id) / "step.lock" if step_id else run.lock_path
+    with path.open("rb" if probe else "r+b") as f:
         if os.name == "nt":
             import msvcrt
             try:
@@ -608,6 +658,23 @@ def lock(run, *, probe=False):
             except BlockingIOError as exc:
                 raise Busy() from exc
         yield  # Closing the descriptor releases the OS lock even on process termination.
+
+
+@contextmanager
+def state_lock(run):
+    deadline = time.monotonic() + 10
+    while True:
+        entered = False
+        try:
+            with lock(run):
+                entered = True
+                recover_revision(run)
+                yield
+            return
+        except Busy:
+            if entered or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.025)
 
 
 def new_run(cfg, workspace, steps, status="ready"):
@@ -627,28 +694,53 @@ def new_run(cfg, workspace, steps, status="ready"):
     run.lock_path.write_bytes(b"0")
     for step in steps:
         (run.path / "steps" / step["id"]).mkdir(parents=True)
+        (run.path / "steps" / step["id"] / "step.lock").write_bytes(b"0")
         step["status"] = "pending"
     state = {"version":2, "run_id":run.path.name, "workspace":str(workspace), "status":status,
-             "config":cfg, "steps":steps, "created_at":timestamp()}
+             "config":cfg, "steps":steps, "created_at":timestamp(), "concurrent":True}
     write_json(run.state_path, state)
     return run
 
 
 def saved_spec(state):
-    return {"steps":[{k:s[k] for k in STEP_FIELDS} for s in state["steps"]]}
+    return {"steps":[{k:s[k] for k in STEP_FIELDS if k in s} for s in state["steps"]]}
+
+
+def compatible_config(state):
+    current = config()
+    saved = state["config"]
+    if current == saved:
+        return current
+    # Only migrate the two historical AGY defaults, and only when none of this
+    # run's actual bindings change. All other configuration drift is rejected.
+    normalized = copy.deepcopy(saved)
+    models = normalized.get("agents", {}).get("antigravity", {}).get("models", {})
+    for model, old_level in (("gemini-pro-orchestrator", "medium"),
+                             ("gemini-pro-orchestrator-neon", "high")):
+        if models.get(model) == [old_level]:
+            models[model] = ["default"]
+    for route_id, model, old_level in (("vfx", "gemini-pro-orchestrator", "medium"),
+                                       ("perf_analysis", "gemini-pro-orchestrator-neon", "high")):
+        route = normalized.get("routes", {}).get(route_id, {})
+        if (route.get("agent"), route.get("model"), route.get("level")) == ("antigravity", model, old_level):
+            route["level"] = "default"
+    require(normalized == current and
+            all(binding(saved, step) == binding(current, step) for step in state["steps"]),
+            "Configuration changed since this run was saved; preview the affected plan again")
+    return current
 
 
 def activate_plan(run, state):
     try:
-        cfg = config()
-        require(cfg == state["config"], "Configuration changed after this preview")
+        cfg = compatible_config(state)
         from sync_supervisor import check_synced
         check_synced(ROOT, cfg)
     except (OSError, ValueError) as exc:
         raise Invalid(f"{exc}. Update the configuration if needed and preview the plan again.") from exc
     workspace = workspace_path(state["workspace"])
     require(str(workspace) == state["workspace"], "Workspace path changed since the preview")
-    steps = validate(saved_spec(state), cfg, workspace, legacy=run.legacy)
+    steps = validate(saved_spec(state), cfg, workspace, legacy=run.legacy,
+                     concurrent=state.get("concurrent", False))
     state["config"] = cfg
     state["steps"] = [dict(s, status="pending") for s in steps]
     state["status"] = "ready"
@@ -696,11 +788,10 @@ def advance(run, state, *, one_step=False, step_id=None, stream=False):
                 return
     workspace = Path(state["workspace"])
     if not run.legacy and not activating and any(s["status"] == "pending" for s in state["steps"]):
-        cfg = config()
-        require(cfg == state["config"], "Configuration changed since this run was saved")
+        cfg = compatible_config(state)
         from sync_supervisor import check_synced
         check_synced(ROOT, cfg)
-        steps = validate(saved_spec(state), cfg, workspace, check_refs=False)
+        steps = validate(saved_spec(state), cfg, workspace, check_refs=False, concurrent=False)
         require([s["id"] for s in steps] == [s["id"] for s in state["steps"]],
                 "Saved steps are out of dependency order")
         state["config"] = cfg
@@ -745,6 +836,238 @@ def advance(run, state, *, one_step=False, step_id=None, stream=False):
             return
 
 
+def concurrent_advance(run, *, one_step=False, step_id=None, stream=False, expected_agent=None):
+    """Hold one step lease while workers run; serialize only state transactions."""
+    while True:
+        with state_lock(run):
+            state = read_state(run)
+            if state["status"] == "planned":
+                activate_plan(run, state)
+            if step_id:
+                step = next((s for s in state["steps"] if s["id"] == step_id), None)
+                require(step is not None, f"Unknown step: {step_id}")
+            else:
+                completed = {s["id"] for s in state["steps"] if s["status"] == "success"}
+                step = next((s for s in state["steps"] if s["status"] == "pending" and
+                             set(s["needs"]) <= completed), None)
+            if step is None:
+                return snapshot(run, state)
+            route = binding(state["config"], step)
+            require(expected_agent is None or route["agent"] == expected_agent,
+                    f"{step['id']}: expected agent {expected_agent}, saved agent is {route['agent']}")
+            if step["status"] in STEP_TERMINAL:
+                return snapshot(run, state)
+            lease = lock(run, step_id=step["id"])
+            lease.__enter__()
+        try:
+            with state_lock(run):
+                state = read_state(run)
+                step = next(s for s in state["steps"] if s["id"] == step["id"])
+                if step["status"] in ("running", "needs_claude"):
+                    journal = read_journal(run, step)
+                    if journal:
+                        commit_result(run, state, step, journal)
+                    elif step["status"] == "running":
+                        commit_result(run, state, step, {
+                            "id":step["id"], "status":"interrupted", "outputs":[],
+                            "summary":"Previous launch ended without a committed result. Inspect its logs before retrying.",
+                            "interrupted_at":timestamp()})
+                    return snapshot(run, state)
+                if step["status"] in STEP_TERMINAL:
+                    return snapshot(run, state)
+                ready = {s["id"] for s in state["steps"] if s["status"] == "success"}
+                require(set(step["needs"]) <= ready, f"{step['id']}: dependencies have not succeeded")
+                writers = [s for s in state["steps"] if s["id"] != step["id"] and
+                           s["status"] in {"running", "needs_claude"} and s["access"] == "write"]
+                require(step["access"] != "write" or not writers or
+                        step["outputs"] and all(s["outputs"] for s in writers),
+                        f"{step['id']}: serialize writes when either step has no declared output files")
+                state["config"] = compatible_config(state)
+                from sync_supervisor import check_synced
+                check_synced(ROOT, state["config"])
+                workspace = workspace_path(state["workspace"])
+                validate(saved_spec(state), state["config"], workspace, check_refs=False)
+                route = binding(state["config"], step)
+                require(expected_agent is None or route["agent"] == expected_agent,
+                        f"{step['id']}: saved agent changed before dispatch")
+                step["started_at"] = timestamp()
+                state.setdefault("started_at", step["started_at"])
+                step["status"] = "running"
+                refresh_status(state)
+                write_json(run.state_path, state)
+                sid = step["id"]
+                try:
+                    for ref in step["refs"]:
+                        require(artifact_path(workspace, ref).is_file(), f"Missing input: {ref}")
+                    step["before"] = {n:digest(artifact_path(workspace, n)) for n in step["outputs"]}
+                    task = task_payload(run, state, step)
+                    step_dir = run.step_dir(sid)
+                    write_json(step_dir / "step-input.json", {**task, **route})
+                    if native_step(state["config"], route):
+                        step.update(status="needs_claude", claim=secrets.token_hex(16))
+                        refresh_status(state)
+                        write_json(run.state_path, state)
+                        return snapshot(run, state, {**task, **route, "workspace":str(workspace),
+                                        "step_dir":str(step_dir), "claim":step["claim"]})
+                    write_json(run.state_path, state)
+                    setup_error = None
+                except Exception as exc:
+                    setup_error = {"status":"failed", "summary":f"{type(exc).__name__}: {exc}"}
+                cfg = state["config"]
+            if setup_error is None:
+                try:
+                    from workers import run_worker
+                    on_progress = (lambda event: stream_event(step, route, event)) if stream else None
+                    report = run_worker(route["agent"], cfg["agents"][route["agent"]],
+                                        route["model"], route["level"], task, workspace, step_dir,
+                                        on_progress=on_progress)
+                except KeyboardInterrupt:
+                    with state_lock(run):
+                        current = read_state(run)
+                        selected = next(s for s in current["steps"] if s["id"] == sid)
+                        result = {"id":sid, "status":"interrupted", "outputs":[],
+                                  "summary":"Execution cancelled by the user.", "interrupted_at":timestamp()}
+                        write_json(run.result_path(sid), result)
+                        commit_result(run, current, selected, result)
+                        return snapshot(run, current)
+                except Exception as exc:
+                    report = {"status":"failed", "summary":f"{type(exc).__name__}: {exc}"}
+            else:
+                report = setup_error
+            with state_lock(run):
+                state = read_state(run)
+                step = next(s for s in state["steps"] if s["id"] == sid)
+                finish(run, state, step, report)
+                if stream:
+                    stream_event(step, route, {"time":step.get("finished_at"),
+                                 "message":f"回执已保存 · {step['status']} · {run.result_path(sid)}\n{step['summary'][:600]}"})
+                result = snapshot(run, state)
+            if one_step or step_id or state["status"] in TERMINAL:
+                return result
+        finally:
+            lease.__exit__(None, None, None)
+
+
+def revise(run, spec):
+    """Revise future work, explicitly retrying settled failures with archived receipts."""
+    require(not run.legacy, "Legacy runs must continue with their saved plan")
+    allowed_keys(spec, ("steps", "retry"), "revision")
+    retry = set(string_list(spec.get("retry", []), "retry"))
+    with state_lock(run):
+        state = read_state(run)
+        require(state.get("concurrent"), "This older run supports continuation with its saved plan")
+        cfg = compatible_config(state)
+        rows = validate({"steps":spec.get("steps")}, cfg, Path(state["workspace"]), check_refs=False)
+        state["config"] = cfg
+        previous = {s["id"]:s for s in state["steps"]}
+        incoming = {s["id"]:s for s in rows}
+        require(retry <= previous.keys(), "Retry names an unknown step")
+        immutable = [s for s in state["steps"] if s["status"] != "pending" and s["id"] not in retry]
+        for step in immutable:
+            require(step["id"] in incoming and
+                    {k:step[k] for k in STEP_FIELDS if k in step} == incoming[step["id"]],
+                    f"{step['id']}: started steps are immutable; retry failures explicitly")
+        for sid in retry:
+            require(sid in incoming and previous[sid]["status"] in {"failed", "interrupted", "blocked"},
+                    f"{sid}: only a settled failed/interrupted/blocked step can be retried")
+        for old in state["steps"]:
+            if old["status"] == "pending" or old["id"] in retry:
+                with lock(run, probe=True, step_id=old["id"]):
+                    pass
+        # Completed or active work may already depend on a retry candidate.
+        for step in immutable:
+            require(not (retry & set(step["needs"])),
+                    f"{step['id']}: cannot retry a dependency of started work")
+        history = state.setdefault("plan_history", [])
+        history.append({"revised_at":timestamp(), "steps":state["steps"], "retry":sorted(retry)})
+        updated = []
+        resets = {}
+        for row in rows:
+            sid = row["id"]
+            old = previous.get(sid)
+            if old and old["status"] != "pending" and sid not in retry:
+                updated.append(old)
+                continue
+            directory = run.path / "steps" / sid
+            if not directory.exists():
+                directory.mkdir()
+                (directory / "step.lock").write_bytes(b"0")
+            require(directory.resolve() == directory and not directory.is_symlink(),
+                    f"Redirected STEAM step directory: {directory}")
+            if sid in retry:
+                import shutil
+                archive = directory / "attempts" / str(len(history))
+                archive.mkdir(parents=True, exist_ok=True)
+                require(archive.resolve() == archive and not archive.is_symlink(),
+                        f"Redirected retry archive: {archive}")
+                resets[sid] = []
+                for entry in directory.iterdir():
+                    if entry.name not in {"step.lock", "attempts"} and entry.is_file():
+                        require(not entry.is_symlink(), f"Redirected retry record: {entry}")
+                        shutil.copy2(entry, archive / entry.name)
+                        resets[sid].append(entry.name)
+            updated.append(dict(row, status="pending"))
+        state["steps"] = updated
+        if state["status"] != "planned":
+            refresh_status(state)
+        state["revision_id"] = secrets.token_hex(16)
+        # Commit the intent after all copies exist. Any later interruption is
+        # replayed under run.lock before a step is allowed to dispatch.
+        write_json(run.path / "revision.json", {"state":state, "resets":resets})
+        recover_revision(run)
+        return snapshot(run, state)
+
+
+def recover_revision(run):
+    journal = run.path / "revision.json"
+    if not journal.exists():
+        return
+    require(not journal.is_symlink(), "Redirected revision journal")
+    transaction = read_json(journal)
+    replacement = transaction["state"]
+    require(replacement["run_id"] == run.path.name and
+            replacement["workspace"] == str(run.path.parent.parent),
+            "Revision belongs to another run")
+    current = read_json(run.state_path)
+    resets = transaction.get("resets")
+    require(isinstance(resets, dict), "Invalid revision cleanup steps")
+    current_ids = {step["id"] for step in current.get("steps", [])}
+    replacement_ids = {step["id"] for step in replacement.get("steps", [])}
+    for sid, names in resets.items():
+        require(isinstance(sid, str) and ID.fullmatch(sid) and
+                (os.name != "nt" or not WINDOWS_DEVICE_ID.fullmatch(sid)) and
+                sid in current_ids and sid in replacement_ids,
+                "Invalid revision cleanup step ID")
+        require(isinstance(names, list) and all(isinstance(name, str) and Path(name).name == name and
+                name not in {"step.lock", "attempts"} for name in names), "Invalid revision cleanup record")
+    if current.get("revision_id") != replacement["revision_id"]:
+        for sid, names in resets.items():
+            directory = run.step_dir(sid)
+            for name in names:
+                path = directory / name
+                require(not path.is_symlink(), f"Redirected retry record: {path}")
+                path.unlink(missing_ok=True)
+        write_json(run.state_path, replacement)
+    journal.unlink()
+
+
+def concurrent_complete(run, step_id, claim, reply):
+    with lock(run, step_id=step_id):
+        with state_lock(run):
+            state = read_state(run)
+            step = next((s for s in state["steps"] if s["id"] == step_id), None)
+            require(step is not None, f"Unknown step: {step_id}")
+            require(step.get("claim") == claim, "Use the claim from the original Claude handoff")
+            journal = read_journal(run, step)
+            if step["status"] == "needs_claude" and journal is not None:
+                commit_result(run, state, step, journal)
+            elif step["status"] == "needs_claude":
+                finish(run, state, step, native_report(reply, run, step_id))
+            else:
+                require(step["status"] in STEP_TERMINAL, f"{step_id}: no pending Claude handoff")
+            return snapshot(run, state)
+
+
 def native_report(file, run, step_id):
     original = (sys.stdin.buffer.read() if file == "-" else Path(file).read_bytes()).decode("utf-8")
     text = original.removeprefix("\ufeff").strip()
@@ -761,8 +1084,10 @@ def native_report(file, run, step_id):
 def show_catalog(cfg, short=False):
     if short:
         return {"status":"ok", "supervisor":cfg["supervisor"], "limits":cfg["limits"],
-                "routes":{k:{"agent":r["agent"], "description":r.get("description","")}
-                          for k,r in cfg["routes"].items() if cfg["agents"][r["agent"]].get("enabled",True)}}
+                "agents":{a:{"adapter":v["adapter"], "models":v["models"]}
+                          for a,v in cfg["agents"].items() if v.get("enabled", True)},
+                "routes":{k:r for k,r in cfg["routes"].items()
+                          if cfg["agents"][r["agent"]].get("enabled",True)}}
     return {"status":"ok", "supervisor":cfg["supervisor"], "limits":cfg["limits"],
             "agents":{a:{"adapter":v["adapter"], "enabled":v.get("enabled", True), "models":v["models"]}
                       for a,v in cfg["agents"].items()},
@@ -851,13 +1176,16 @@ def cli():
             c.add_argument("--save", action="store_true", help="Save the preview for an exact later continuation")
         if name != "check":
             c.add_argument("--spec", required=True, help="UTF-8 JSON file, or - for stdin")
-    for name in ("continue", "result", "complete"):
+    for name in ("continue", "result", "complete", "revise"):
         c = sub.add_parser(name)
         c.add_argument("--run-dir", required=True)
         if name == "continue":
             c.add_argument("--one-step", action="store_true", help="Return after one step or recovered result")
             c.add_argument("--step", help="Execute only this exact next step; settled steps are never relaunched")
             c.add_argument("--stream", action="store_true", help="Stream readable worker activity to stderr")
+            c.add_argument("--agent", help="Refuse dispatch if the saved step uses another agent")
+        if name == "revise":
+            c.add_argument("--spec", required=True, help="Replacement plan with optional retry IDs")
         if name == "result":
             c.add_argument("--wait", type=float, default=0, metavar="SECONDS",
                            help="Wait up to 60 seconds for new activity or a state change")
@@ -892,9 +1220,25 @@ def cli():
     if args.cmd == "result":
         require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
         return wait_result(run, args.wait)
+    if args.cmd == "revise":
+        spec = parse_json(sys.stdin.buffer.read().decode("utf-8-sig")) if args.spec == "-" else read_json(args.spec)
+        return revise(run, spec)
     try:
+        saved = read_state(run)
+        if saved.get("concurrent"):
+            if args.cmd == "complete":
+                return concurrent_complete(run, args.step, args.claim, args.reply)
+            return concurrent_advance(run, one_step=args.cmd == "continue" and args.one_step,
+                                      step_id=args.step if args.cmd == "continue" else None,
+                                      stream=args.cmd == "continue" and args.stream,
+                                      expected_agent=args.agent if args.cmd == "continue" else None)
         with lock(run):
             state = read_state(run)
+            if args.cmd == "continue" and args.agent:
+                require(args.step, "--agent requires --step")
+                selected = next((s for s in state["steps"] if s["id"] == args.step), None)
+                require(selected is not None and binding(state["config"], selected)["agent"] == args.agent,
+                        "Saved step does not use the expected agent")
             handoff = None
             recovered = False
             if state["status"] == "needs_claude":
@@ -925,7 +1269,7 @@ def cli():
     except Busy:
         out = snapshot(run, read_state(run))
         return {**out, "run_status":out["status"], "status":"busy", "execution_active":out["status"] == "running",
-                "recovery_required":False, "summary":"Another invocation holds this run lock"}
+                "recovery_required":False, "summary":"Another invocation holds a run or step lock"}
 
 
 if __name__ == "__main__":
