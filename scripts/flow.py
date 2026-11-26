@@ -10,6 +10,7 @@ import secrets
 import struct
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -480,10 +481,46 @@ def needs_claude_cli(model, level, supervisor):
     return model.startswith("claude-") and (model, level) != (supervisor["model"], supervisor["level"])
 
 
+def native_step(cfg, route):
+    return cfg["agents"][route["agent"]]["adapter"] == "claude" and not needs_claude_cli(
+        route["model"], route["level"], cfg["supervisor"])
+
+
 def describe_step(cfg, step):
+    route = binding(cfg, step)
     return {**{k:step[k] for k in ("id","route","needs","access","kind","refs")},
             "brief":step["brief"][:600], "status":step.get("status", "pending"),
-            **binding(cfg, step), **timing(step)}
+            "dispatch":"native" if native_step(cfg, route) else "cli", **route, **timing(step)}
+
+
+def step_activity(run, step):
+    from workers import read_progress
+    activity = read_progress(run.step_dir(step["id"]))
+    if not activity:
+        return {}
+    return {"activity":{"updated_at":activity.get("updated_at"), "latest":activity.get("latest"),
+                        "history":f"steps/{step['id']}/progress.jsonl"}}
+
+
+def stream_event(step, route, event):
+    stamp = event.get("time")
+    try:
+        stamp = datetime.fromisoformat(stamp).astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError):
+        stamp = datetime.now().strftime("%H:%M:%S")
+    message = str(event.get("message", "")).strip()
+    if message:
+        line = f"[{stamp}] {step['id']} · {step['route']} · {route['agent']}  {message}\n"
+        try:
+            binary = getattr(sys.stderr, "buffer", None)
+            if binary is not None:
+                binary.write(line.encode("utf-8", errors="replace"))
+                binary.flush()
+            else:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        except (OSError, ValueError, UnicodeError):
+            pass  # A closed live-output view must not change the persisted worker result.
 
 
 def show_plan(cfg, workspace, steps, run=None):
@@ -501,6 +538,7 @@ def snapshot(run, state, handoff=None):
     out = {"status":state["status"], "run_dir":str(run.path),
            "workspace":state["workspace"], "progress":progress(state["steps"]), **timing(state),
            "steps":[{**describe_step(state["config"], s),
+                     **step_activity(run, s),
                      "declared_outputs":s["outputs"],
                      **({"summary":s["summary"][:600]} if "summary" in s else {}),
                      **({"full_result":f"steps/{s['id']}/{run.result_name}"} if len(s.get("summary","")) > 600 else {}),
@@ -538,6 +576,19 @@ def query_result(run):
                 if step["status"] == "running":
                     step.pop("elapsed_seconds", None)
     return {**out, "execution_active":active, "recovery_required":recover}
+
+
+def wait_result(run, seconds):
+    result = query_result(run)
+    signature = [(s["id"], s["status"], s.get("activity")) for s in result["steps"]]
+    deadline = time.monotonic() + seconds
+    while result["execution_active"] and time.monotonic() < deadline:
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        result = query_result(run)
+        current = [(s["id"], s["status"], s.get("activity")) for s in result["steps"]]
+        if current != signature:
+            break
+    return result
 
 
 @contextmanager
@@ -610,7 +661,17 @@ def read_journal(run, step):
     return read_json(path) if path.is_file() else None
 
 
-def advance(run, state, *, one_step=False):
+def advance(run, state, *, one_step=False, step_id=None, stream=False):
+    if step_id is not None:
+        selected = next((s for s in state["steps"] if s["id"] == step_id), None)
+        require(selected is not None, f"Unknown step: {step_id}")
+        if selected["status"] in STEP_TERMINAL:
+            return  # Retrying a route wrapper cannot dispatch another step.
+        current = next((s for s in state["steps"] if s["status"] in ("running", "needs_claude")), None)
+        current = current or next((s for s in state["steps"] if s["status"] == "pending"), None)
+        require(current is not None and current["id"] == step_id,
+                f"{step_id} cannot run yet; current step is {current['id'] if current else 'none'}")
+        one_step = True
     activating = state["status"] == "planned"
     if activating:
         activate_plan(run, state)
@@ -660,8 +721,7 @@ def advance(run, state, *, one_step=False):
                 require(artifact_path(workspace, ref).is_file(), f"Missing input: {ref}")
             step["before"] = {n:digest(artifact_path(workspace, n)) for n in step["outputs"]}
             task = task_payload(run, state, step)
-            native = agent["adapter"] == "claude" and not needs_claude_cli(
-                route["model"], route["level"], state["config"]["supervisor"])
+            native = native_step(state["config"], route)
             write_json(step_dir / ("task.json" if run.legacy else "step-input.json"), {**task, **route})
             step["status"] = state["status"] = "needs_claude" if native else "running"
             if native:
@@ -672,10 +732,15 @@ def advance(run, state, *, one_step=False):
                 return {**task, **route, "workspace":str(workspace), "step_dir":str(step_dir),
                         "claim":step["claim"]}
             from workers import run_worker
-            report = run_worker(agent_id, agent, route["model"], route["level"], task, workspace, step_dir)
+            on_progress = (lambda event: stream_event(step, route, event)) if stream else None
+            report = run_worker(agent_id, agent, route["model"], route["level"], task, workspace, step_dir,
+                                on_progress=on_progress)
         except Exception as e:
             report = {"status":"failed", "summary":f"{type(e).__name__}: {e}"}
         finish(run, state, step, report)
+        if stream:
+            stream_event(step, route, {"time":step.get("finished_at"),
+                         "message":f"回执已保存 · {step['status']} · {run.result_path(step['id'])}\n{step['summary'][:600]}"})
         if one_step or state["status"] == "failed":
             return
 
@@ -764,10 +829,19 @@ def read_state(run):
     return state
 
 
+def input_path(workspace):
+    directory = workspace / WORKBENCH / "steam-inputs"
+    require(directory.resolve() == directory, f"Redirected STEAM input directory: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory / (secrets.token_hex(16) + ".json"))
+
+
 def cli():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("catalog").add_argument("--short", action="store_true")
+    catalog = sub.add_parser("catalog")
+    catalog.add_argument("--short", action="store_true")
+    catalog.add_argument("--workspace", help="Also prepare a fresh JSON input path in this project")
     sub.add_parser("input-path", help="Prepare a fresh path for a JSON plan or receipt").add_argument(
         "--workspace", required=True)
     for name in ("check", "plan", "run"):
@@ -782,22 +856,27 @@ def cli():
         c.add_argument("--run-dir", required=True)
         if name == "continue":
             c.add_argument("--one-step", action="store_true", help="Return after one step or recovered result")
+            c.add_argument("--step", help="Execute only this exact next step; settled steps are never relaunched")
+            c.add_argument("--stream", action="store_true", help="Stream readable worker activity to stderr")
+        if name == "result":
+            c.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                           help="Wait up to 60 seconds for new activity or a state change")
         if name == "complete":
             c.add_argument("--step", required=True)
             c.add_argument("--claim", help="Claim from the original Claude handoff")
             c.add_argument("--reply", required=True)
     args = p.parse_args()
     if args.cmd == "input-path":
-        directory = workspace_path(args.workspace) / WORKBENCH / "steam-inputs"
-        require(directory.resolve() == directory, f"Redirected STEAM input directory: {directory}")
-        directory.mkdir(parents=True, exist_ok=True)
-        return {"status": "ok", "path": str(directory / (secrets.token_hex(16) + ".json"))}
+        return {"status":"ok", "path":input_path(workspace_path(args.workspace))}
     if args.cmd in ("catalog", "check", "plan", "run"):
         cfg = config()
         from sync_supervisor import check_synced
         check_synced(ROOT, cfg)
         if args.cmd == "catalog":
-            return show_catalog(cfg, args.short)
+            result = show_catalog(cfg, args.short)
+            if args.workspace:
+                result["input_path"] = input_path(workspace_path(args.workspace))
+            return result
         workspace = workspace_path(args.workspace)
         if args.cmd == "check":
             return check(cfg, workspace)
@@ -811,7 +890,8 @@ def cli():
     else:
         run = owned_run(args.run_dir)
     if args.cmd == "result":
-        return query_result(run)
+        require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
+        return wait_result(run, args.wait)
     try:
         with lock(run):
             state = read_state(run)
@@ -819,6 +899,13 @@ def cli():
             recovered = False
             if state["status"] == "needs_claude":
                 waiting = next(s for s in state["steps"] if s["status"] == "needs_claude")
+                if args.cmd == "continue" and args.step:
+                    selected = next((s for s in state["steps"] if s["id"] == args.step), None)
+                    require(selected is not None, f"Unknown step: {args.step}")
+                    if selected["status"] in STEP_TERMINAL:
+                        return snapshot(run, state)
+                    require(waiting["id"] == args.step,
+                            f"{args.step} cannot run yet; current step is {waiting['id']}")
                 result = read_journal(run, waiting)
                 if result is not None:
                     commit_result(run, state, waiting, result)
@@ -830,8 +917,10 @@ def cli():
                 # Handoffs issued before claims were introduced are completed without a token.
                 require(step.get("claim") == args.claim, "Use the claim from the original Claude handoff")
                 finish(run, state, step, native_report(args.reply, run, step["id"]))
-            elif not (args.cmd == "continue" and args.one_step and recovered):
-                handoff = advance(run, state, one_step=args.cmd == "continue" and args.one_step)
+            elif not (args.cmd == "continue" and (args.one_step or args.step) and recovered):
+                handoff = advance(run, state, one_step=args.cmd == "continue" and args.one_step,
+                                  step_id=args.step if args.cmd == "continue" else None,
+                                  stream=args.cmd == "continue" and args.stream)
             return snapshot(run, state, handoff)
     except Busy:
         out = snapshot(run, read_state(run))

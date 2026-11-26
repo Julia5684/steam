@@ -36,8 +36,8 @@ Steam 默认只接受手动调用。Claude Code 使用 `/steam`，Codex 使用 `
 | --- | --- |
 | `/steam --check` | 检查本地 CLI、可确认的登录状态及配置的模型和推理等级。目录缺少组合时返回 `attention`，在 `missing_models` 中列出差项。无法读取目录时也会提示。Claude 主管会运行一次。真实任务的权限和订阅剩余额度仍由各产品判定。 |
 | `/steam --plan 任务` | 主管拆解，脚本校验步骤、依赖、额度和模型配置，在项目的 `.workbench/<task_id>/` 保存已校验的计划并展示将要派给谁。无需运行外部模型；稍后可用返回的 `/steam --resume` 命令直接执行同一计划。 |
-| `/steam 任务` | 先在聊天里列出全部子任务、分工和依赖，再按顺序派发。每一步返回就报告结果和剩余项数。普通 Bug 通常合并为一次 Codex 调用。 |
-| `/steam --result 运行目录` | 随时查看每项由谁执行、当前状态、已记录的起止时间，以及整项任务的进度。 |
+| `/steam 任务` | 按路由分工。单步直接显示任务名和执行器，多步先列分工与依赖。展开任务可以看执行过程，结束后在当前聊天收到结论。 |
+| `/steam --result 运行目录` | 查看各步骤的执行器、状态、最近的执行活动、已记录的起止时间及完成回执摘要。 |
 | `/steam --resume 运行目录` | 执行已预览的计划，或从检查点继续。若预览后修改配置，先用新配置重新预览。已交给 Claude 原生会话的步骤会显示 `waiting_claude`，由原会话提交回执。中断时无法判定结果的外部调用会保留待核实记录。 |
 
 也可以直接在项目目录的终端做环境检查，全程由本机脚本执行，不启动 Claude 主管。Windows PowerShell 示例：
@@ -52,7 +52,13 @@ macOS、Linux 或 WSL 示例：
 python3 ~/.claude/skills/steam/scripts/flow.py check --workspace .
 ```
 
-Claude Code 的主管在当前聊天汇报进度。例如，有两个子任务时，你会先看到项目结构分析由 Codex 执行，接入说明由 Claude 在分析完成后编写。分析交回结果时，聊天会显示它的完成时刻、耗时和剩余的文档任务。长步骤等待期间会更新已用时间。全部成功后显示「全部完成（2/2）」和总耗时。遇到失败或中断时，会列明受影响的步骤。旧运行只显示已记录的时间。
+### 在 Desktop 看子任务怎么执行
+
+例如输入 `/steam 分析当前项目`，主管会派发「分析项目结构 · Codex」。点开该 Agent 的工具输出可看 Codex 执行期间发出的公开说明、工具活动和结果摘要。Antigravity 的工具调用与公开输出也经过同一条通道。各 CLI 暴露的事件不同，有新事件时才会更新。Desktop 将 Agent 放到后台时，也可从 **Background tasks** 点开对应任务。[Claude Desktop 任务面板](https://code.claude.com/docs/en/desktop#watch-background-tasks)
+
+主聊天保留关键进展。步骤结束后，主管读取回执，把分析结论、改动或产物直接交给你。多步任务会接着推进剩余步骤，最后显示完成数和总耗时；失败或中断时列出原因及受影响的步骤。旧运行可以继续查询已有回执。
+
+Claude Code 每派发一个外部步骤，就用一个原生子 Agent 展示执行过程，这部分计入 Claude 会话用量。分析或修改由路由配置的 Codex、Antigravity 或专项 Claude CLI 执行。Codex 客户端和缺少原生 Agent 工具的环境直接在前台命令中显示同一份事件流。
 
 本次命令可附上相关日志、截图或参数的项目内路径。只要求界面动画设计时，`motion_ux` 交付时间线、可交互时刻和中断行为。同时要求接入工程时，`integration` 接续设计结果。
 
@@ -92,7 +98,7 @@ py -3 scripts/sync_supervisor.py
 python3 scripts/sync_supervisor.py
 ```
 
-默认由 `opus / high` 主管拆分任务、派工和汇总结果。文档写作交给 `sonnet / medium` 原生子 Agent，界面动画设计交给 `opus / medium` 原生子 Agent。具体模型由 Claude Code 解析家族别名。如果任务配置的模型和档位与主管相同，由主管直接执行。如果为专项任务指定了其他完整型号，脚本会通过本机 Claude Code CLI 传递该型号和档位。
+默认由 `opus / high` 主管拆分任务、派工和汇总结果。文档写作交给 `sonnet / medium` 原生子 Agent，界面动画设计交给 `opus / medium` 原生子 Agent。具体模型由 Claude Code 解析家族别名。缺少子 Agent 工具时，主管可直接处理与自身模型和档位相同的原生步骤。如果为专项任务指定了其他完整型号，脚本会通过本机 Claude Code CLI 传递该型号和档位。
 
 Antigravity 按 `agy models` 返回的目录选择型号和档位。使用 Orchestrator 时，Carbon 对应 `gemini-pro-orchestrator`，Neon 对应 `gemini-pro-orchestrator-neon`。AGY 1.5.17 对这两个目录项使用产品默认档位，在 `agents` 和 `routes` 里填 `default`。需要固定档位时，选择目录里带相应档位的型号，例如 `gemini-4-neon` 配 `high` 会匹配 `gemini-4-neon-high`。`--check` 会列出当前目录缺少的组合。
 
@@ -109,12 +115,14 @@ Antigravity 按 `agy models` 返回的目录选择型号和档位。使用 Orche
 └── steps/<步骤ID>/
     ├── step-input.json        # 步骤简报、执行器配置和上游依赖
     ├── step-result.json       # 完整结果和已验证的产物路径
+    ├── progress.json          # 外部步骤最近的执行活动，运行中可读
+    ├── progress.jsonl         # 外部步骤的按时间排列的近期事件
     ├── stdout.log             # 外部执行器标准输出
     ├── stderr.log             # 外部执行器标准错误
     └── claude-receipt.json    # Claude 原生步骤的原始 JSON 回执
 ```
 
-保存计划时先创建运行状态和步骤目录，各步骤文件随执行生成。外部执行器写入两份日志，Claude 原生步骤保存回执。返回给主管的是短摘要，完整结果和诊断保留在运行目录中。续跑时会校验运行目录所属项目及保存的计划，并使用本机安装目录的配置派发。旧版系统临时目录中的运行仍支持原路径的查询、续跑和回执提交，沿用原文件名。
+保存计划时先创建运行状态和步骤目录，各步骤文件随执行生成。外部执行器将近期活动和有大小上限的 CLI 日志写入步骤目录，Claude 原生步骤保存回执。在终端用 `continue --one-step --step "<ID>" --stream --run-dir "<目录>"` 可查看实时活动。该命令向 stderr 输出进度，stdout 保留一个结果 JSON。`result --run-dir "<目录>" --wait 30` 在外部步骤运行时最多等 30 秒，活动或状态变化时提前返回。续跑时会校验运行目录所属项目及保存的计划，并使用本机安装目录的配置派发。旧版系统临时目录的运行仍支持原路径的查询、续跑和回执提交。
 
 Claude Code 会将计划和回执的输入 JSON 写到项目的 `.workbench/steam-inputs/`。每份输入使用独立文件名，Shell 命令只传文件路径。使用 Git 的项目可在自己的 `.gitignore` 中加入 `/.workbench/steam-run-*/` 和 `/.workbench/steam-inputs/`。任务结束后可按需归档或删除这些记录。
 

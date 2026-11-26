@@ -10,6 +10,8 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 RECEIPT_SCHEMA = str(Path(__file__).resolve().with_name("receipt.schema.json"))
@@ -29,6 +31,159 @@ LEVEL = re.compile(r"[a-z][a-z0-9_-]{0,30}\Z")
 
 class WorkerError(RuntimeError):
     pass
+
+
+def _atomic_write(path, data):
+    """Publish a snapshot without following a path created by the worker."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+        output.write(data)
+        temporary = output.name
+    try:
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def read_progress(step_dir):
+    path = Path(step_dir) / "progress.json"
+    try:
+        if path.is_symlink() or path.stat().st_size > LOG_LIMIT:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) and isinstance(value.get("latest"), dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+class _Progress:
+    def __init__(self, step_dir, callback):
+        self.step_dir = Path(step_dir)
+        self.callback = callback
+        self.events = []
+        self.history = bytearray()
+        self.lock = threading.Lock()
+
+    def emit(self, kind, message, **details):
+        message = _preview(str(message), limit=1200, line_limit=1200)
+        if not message:
+            return
+        with self.lock:
+            if self.events and (self.events[-1]["kind"], self.events[-1]["message"]) == (kind, message):
+                return
+            event = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     "kind": kind, "message": message, **details}
+            self.events = (self.events + [event])[-40:]
+            self.history.extend((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+            if len(self.history) > LOG_LIMIT:
+                del self.history[:self.history.find(b"\n", len(self.history) - LOG_LIMIT) + 1]
+            snapshot = {"updated_at": event["time"], "latest": event, "events": self.events}
+            try:
+                _atomic_write(self.step_dir / "progress.json", json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+                _atomic_write(self.step_dir / "progress.jsonl", self.history)
+            except OSError:
+                # Progress reporting must not invalidate a verified task result.
+                pass
+            if self.callback:
+                try:
+                    self.callback(dict(event))
+                except Exception:
+                    pass
+
+
+def _message_progress(progress, body):
+    """Show public commentary, leaving structured receipts in the result file."""
+    if not isinstance(body, str) or not body.strip():
+        return
+    clean = body.strip()
+    if clean.startswith(("{", "```")):
+        return
+    progress.emit("message", clean)
+
+
+def _tool_context(parameters):
+    if not isinstance(parameters, dict):
+        return ""
+    for key in ("file_path", "path", "AbsolutePath", "TargetFile", "DirectoryPath", "Path"):
+        value = parameters.get(key)
+        if isinstance(value, str) and value.strip():
+            return " · " + " ".join(value.split())[:200]
+    command = parameters.get("command") or parameters.get("CommandLine")
+    if isinstance(command, str):
+        return " · " + _preview(command, limit=500, line_limit=500)
+    return ""
+
+
+def _preview(body, limit=700, line_limit=200):
+    if isinstance(body, dict):
+        body = body.get("content")
+    if isinstance(body, list):
+        body = "\n".join(block.get("text", "") for block in body
+                         if isinstance(block, dict) and block.get("type") == "text"
+                         and isinstance(block.get("text"), str))
+    if not isinstance(body, str) or not body or "\x00" in body:
+        return ""
+    body = ANSI.sub("", body)
+    body = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", body)
+    body = re.sub(r"(?is)<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>", "[省略推理]", body)
+    body = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [已隐藏]", body)
+    body = re.sub(r"(?i)(\b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+                  r"password|secret|token)\b[\s\"']*[:=]\s*[\"']?)([^\s\"',;]+)", r"\1[已隐藏]", body)
+    body = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b", "[已隐藏]", body)
+    if "-----BEGIN " in body and "PRIVATE KEY-----" in body:
+        return "[省略私钥内容]"
+    lines = [line.strip()[:line_limit] for line in body.splitlines() if line.strip()]
+    if len(lines) > 6:
+        lines = lines[:4] + ["…"] + lines[-2:]
+    return " | ".join(lines)[:limit]
+
+
+def _output_preview(body):
+    preview = _preview(body)
+    return " 输出 · " + preview if preview else ""
+
+
+def _codex_progress(progress, event):
+    kind = event.get("type")
+    if kind == "thread.started":
+        progress.emit("started", "Codex 已连接，开始执行任务。")
+    elif kind in {"item.started", "item.completed"}:
+        item = event.get("item") or {}
+        item_type = item.get("type")
+        completed = kind == "item.completed"
+        if item_type == "agent_message" and completed:
+            _message_progress(progress, item.get("text"))
+        elif item_type in {"command_execution", "mcp_tool_call", "web_search", "file_change",
+                           "image_generation", "imageGeneration", "image_generation_call"}:
+            label = {"command_execution": "执行命令", "web_search": "搜索资料", "file_change": "更新文件",
+                     "mcp_tool_call": "调用工具"}.get(item_type, "生成图像")
+            tool = item.get("tool") if item_type == "mcp_tool_call" else item_type
+            if isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", tool):
+                label = f"{label}（{tool}）"
+            if item_type == "command_execution":
+                label += _tool_context(item)
+            elif item_type == "file_change":
+                paths = [change.get("path") for change in item.get("changes", []) if isinstance(change, dict)]
+                label += " · " + ", ".join(path[:160] for path in paths[:3] if isinstance(path, str))
+            result = item.get("result") or {}
+            mcp_failed = item_type == "mcp_tool_call" and isinstance(result, dict) and result.get("isError")
+            failed = bool(mcp_failed or item.get("status") in {"failed", "error"}
+                          or item.get("exit_code") not in {None, 0})
+            ending = "失败。" if failed else "完成。" if completed else "中。"
+            if completed and item_type == "command_execution":
+                ending += f" 退出码 {item.get('exit_code')}。" if item.get("exit_code") is not None else ""
+                ending += _output_preview(item.get("aggregated_output"))
+            elif completed and item_type == "mcp_tool_call":
+                ending += _output_preview(result)
+                error = item.get("error")
+                if error:
+                    detail = error
+                    if isinstance(error, dict):
+                        detail = error.get("message") or error.get("type")
+                    ending += " " + _preview(detail, limit=240)
+            progress.emit("tool_completed" if completed else "tool_started",
+                          label + " " + ending,
+                          status="failed" if failed else "completed" if completed else "running")
 
 
 def _fail(message):
@@ -117,6 +272,7 @@ def _invoke(command, workspace, adapter, *, data=b"", timeout=30, step_dir=None,
     diag = []
 
     def drain(pipe, index):
+        last_snapshot = 0
         try:
             with pipe:
                 while True:
@@ -125,6 +281,13 @@ def _invoke(command, workspace, adapter, *, data=b"", timeout=30, step_dir=None,
                         break
                     room = max(0, cap - len(captured[index]))
                     captured[index].extend(chunk[:room])
+                    if step_dir and room and time.monotonic() - last_snapshot >= 0.25:
+                        name = "stdout.log" if index == 0 else "stderr.log"
+                        try:
+                            _atomic_write(Path(step_dir) / name, captured[index])
+                        except OSError:
+                            pass
+                        last_snapshot = time.monotonic()
                     if len(chunk) > LINE_LIMIT:
                         if not issues:
                             issues.append("CLI 单行输出超过处理上限，无法验证结果。")
@@ -178,12 +341,11 @@ def _invoke(command, workspace, adapter, *, data=b"", timeout=30, step_dir=None,
     if step_dir:
         for name, raw in zip(("stdout.log", "stderr.log"), captured):
             # Exclusive temp + replace avoids following a worker-created symlink.
-            with tempfile.NamedTemporaryFile(dir=step_dir, delete=False) as output:
-                output.write(raw)
-                if len(raw) == cap:
-                    output.write(b"\n[steam: retained log limit reached]\n")
-                tmp_name = output.name
-            os.replace(tmp_name, Path(step_dir) / name)
+            ending = b"\n[steam: retained log limit reached]\n" if len(raw) == cap else b""
+            try:
+                _atomic_write(Path(step_dir) / name, raw + ending)
+            except OSError:
+                pass
     if timed_out:
         raise WorkerError(f"CLI 运行超过 {timeout} 秒，任务未通过。")
     if issues:
@@ -300,7 +462,9 @@ def _prompt(task):
                      "image service, drawing code, or a placeholder. Save each generated raster at its requested project "
                      "path; apply requested cropping or resizing only after generation. Keep any native originals "
                      "intact and report failure if an image or the built-in tool is unavailable.")
-    lines.append('Reply with one JSON object {"status":"success" or "failed","summary":"actual result or precise blocker"}. '
+    lines.append("During execution, use public progress messages when supported to report the current action and "
+                 "important findings. Keep private reasoning out of these messages. "
+                 'For the final reply, return one JSON object {"status":"success" or "failed","summary":"actual result or precise blocker"}. '
                  "For a read-only task include the full substantive answer in summary. Report failures, unavailable "
                  "tools, denied permissions, and incomplete requirements truthfully.")
     return "\n\n".join(lines)
@@ -379,7 +543,7 @@ def _native_image_completed(item):
             and item.get("tool") == "imagegen" and not (item.get("result") or {}).get("isError"))
 
 
-def _run_codex(command, model, level, task, workspace, step_dir, timeout):
+def _run_codex(command, model, level, task, workspace, step_dir, timeout, progress):
     _login(command, workspace)
     image_job = task["kind"] == "image"
     args = ["exec", "--skip-git-repo-check", "--ephemeral", "--json", "--output-schema", RECEIPT_SCHEMA,
@@ -394,6 +558,7 @@ def _run_codex(command, model, level, task, workspace, step_dir, timeout):
                 args += ["--image", str((workspace / ref).resolve())]
     state = {"thread": "", "body": "", "ended": False, "error": "", "image_event": False}
     def event(e):
+        _codex_progress(progress, e)
         kind = e.get("type")
         if kind == "thread.started":
             state["thread"] = e.get("thread_id")
@@ -424,7 +589,7 @@ def _run_codex(command, model, level, task, workspace, step_dir, timeout):
     return result
 
 
-def _run_agy(command, model, level, task, workspace, step_dir, timeout):
+def _run_agy(command, model, level, task, workspace, step_dir, timeout, progress):
     if task["kind"] == "image":
         raise WorkerError("本技能的原生生图管线使用 ChatGPT 登录的 Codex。")
     catalog = _agy_catalog(command, workspace)
@@ -432,7 +597,8 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
     args = ["--input-format", "stream-json", "--output-format", "stream-json", "--json-schema", RECEIPT_SCHEMA,
             "--model", selected, "--sandbox", "--mode",
             "plan" if task["access"] == "read" else "accept-edits"]
-    state = {"result": None, "issue": ""}
+    state = {"result": None, "issue": "", "response_index": None, "response_pending": "",
+             "response_kind": None, "tools": {}, "subagents": set()}
     def event(e):
         name = e.get("event")
         if name == "result":
@@ -440,12 +606,67 @@ def _run_agy(command, model, level, task, workspace, step_dir, timeout):
                 state["issue"] = "单次调用收到了多个终态。"
             state["result"] = e.get("result")
         elif name == "init":
+            progress.emit("started", "Antigravity 已连接，开始执行任务。")
             observed = (e.get("init") or {}).get("model")
             if isinstance(observed, str) and catalog.get(_slug(observed)) != selected:
                 state["issue"] = f"agy 实际模型与指定型号不符：{observed}"
         elif name == "step_update":
             step = e.get("step_update") or {}
             info = step.get("tool_info") or {}
+            step_index = step.get("step_index")
+            if step.get("step_type") == "agent_response":
+                if state["response_index"] != step_index:
+                    state["response_index"] = step_index
+                    state["response_pending"] = ""
+                    state["response_kind"] = None
+                delta = step.get("text_delta")
+                if isinstance(delta, str) and state["response_kind"] != "receipt":
+                    for start in range(0, len(delta), 600):
+                        state["response_pending"] += delta[start:start + 600]
+                        pending = state["response_pending"]
+                        if state["response_kind"] is None:
+                            pending = pending.lstrip()
+                            state["response_pending"] = pending
+                            if not pending or (pending.startswith("`") and len(pending) < 3):
+                                continue
+                            state["response_kind"] = "receipt" if pending.startswith(("{", "```")) else "public"
+                        if state["response_kind"] == "receipt":
+                            state["response_pending"] = ""
+                            break
+                        if len(pending) >= 240:
+                            progress.emit("message", pending)
+                            state["response_pending"] = ""
+                if step.get("state") == "DONE" and state["response_kind"] == "public":
+                    progress.emit("message", state["response_pending"])
+                    state["response_pending"] = ""
+            elif step.get("step_type") == "tool":
+                tool = step.get("tool_name") or info.get("name")
+                tool = tool if isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", tool) else "工具"
+                error = info.get("error")
+                failed = bool(error or str(step.get("state")).lower() in {"failed", "error", "denied", "blocked"})
+                phase = "tool_completed" if failed or step.get("state") == "DONE" else "tool_started"
+                if state["tools"].get(step_index) != (phase, failed):
+                    state["tools"][step_index] = (phase, failed)
+                    context = _tool_context(info.get("parameters"))
+                    ending = "失败。" if failed else "已返回。" if phase == "tool_completed" else "执行中。"
+                    if error:
+                        detail = error
+                        if isinstance(error, dict):
+                            detail = error.get("message") or error.get("type")
+                        ending += " " + _preview(detail, limit=240)
+                    if phase == "tool_completed":
+                        ending += _output_preview(info.get("output"))
+                    progress.emit(phase, f"{tool}{context} {ending}",
+                                  status="failed" if failed else "completed" if phase == "tool_completed" else "running")
+            subagents = (step.get("subagent_info") or {}).get("subagents") or []
+            for child in subagents if isinstance(subagents, list) else []:
+                if not isinstance(child, dict):
+                    continue
+                name = child.get("type_name") or child.get("role") or "子 Agent"
+                identity = (step_index, str(child.get("conversation_id") or name))
+                if identity not in state["subagents"]:
+                    state["subagents"].add(identity)
+                    progress.emit("tool_started", f"Antigravity 已派出子 Agent · {str(name)[:160]}。")
             error = info.get("error")
             error_type = error.get("type", "") if isinstance(error, dict) else ""
             rejected = {"denied", "permission_denied", "forbidden", "unauthorized", "rejected", "blocked"}
@@ -483,24 +704,45 @@ def _claude_login(command, workspace):
         raise WorkerError("Claude CLI 尚未登录，请检查本机 claude auth status。")
 
 
-def _run_claude(command, model, level, task, workspace, step_dir, timeout):
+def _run_claude(command, model, level, task, workspace, step_dir, timeout, progress):
     if task["kind"] == "image":
         raise WorkerError("本技能的原生生图管线使用 ChatGPT 登录的 Codex。")
     tools = "Read,Grep,Glob" + (",Edit,Write" if task["access"] == "write" else "")
     schema = Path(RECEIPT_SCHEMA).read_text(encoding="utf-8")
-    args = ["-p", "--model", model, "--effort", level, "--output-format", "json",
+    args = ["-p", "--model", model, "--effort", level, "--output-format", "stream-json", "--verbose",
             "--json-schema", schema, "--tools", tools, "--restricted",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--no-session-persistence", "--permission-prompts", "none", "--permission-mode",
             "acceptEdits" if task["access"] == "write" else "dontAsk"]
-    rc, out, err, denied = _invoke(command + args, workspace, "claude", data=_prompt(task).encode(),
-                                  timeout=timeout, step_dir=step_dir)
-    try:
-        result = json.loads(out)
-    except ValueError:
-        raise WorkerError(f"Claude CLI 没有返回可解析的 JSON 终态。退出码 {rc}。{err[-600:]}")
+    state = {"result": None, "tools": {}}
+    def event(e):
+        kind = e.get("type")
+        if kind == "result":
+            state["result"] = e
+        elif kind == "system" and e.get("subtype") == "init":
+            progress.emit("started", "Claude CLI 已连接，开始执行任务。")
+        elif kind in {"assistant", "user"}:
+            content = (e.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and kind == "assistant":
+                    _message_progress(progress, block.get("text"))
+                elif block.get("type") == "tool_use":
+                    tool = block.get("name")
+                    tool = tool if isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", tool) else "工具"
+                    state["tools"][block.get("id")] = tool
+                    progress.emit("tool_started", f"{tool}{_tool_context(block.get('input'))} 执行中。")
+                elif block.get("type") == "tool_result":
+                    tool = state["tools"].pop(block.get("tool_use_id"), "工具")
+                    ending = "失败。" if block.get("is_error") else "已返回。"
+                    progress.emit("tool_completed", f"{tool} {ending}" + _output_preview(block.get("content")))
+
+    rc, _, err, denied = _invoke(command + args, workspace, "claude", data=_prompt(task).encode(),
+                                timeout=timeout, step_dir=step_dir, on_event=event)
+    result = state["result"]
     if not isinstance(result, dict):
-        raise WorkerError("Claude CLI 终态格式无效。")
+        raise WorkerError(f"Claude CLI 没有返回可解析的 JSON 终态。退出码 {rc}。{err[-600:]}")
     if (rc or denied or result.get("type") != "result" or result.get("subtype") != "success"
             or result.get("is_error") is not False or result.get("permission_denials") or result.get("errors")):
         detail = denied or str(result.get("errors") or result.get("subtype") or err[-600:])
@@ -525,8 +767,10 @@ def _run_claude(command, model, level, task, workspace, step_dir, timeout):
     return answer
 
 
-def run_worker(agent_id, agent, model, level, task, workspace, step_dir):
+def run_worker(agent_id, agent, model, level, task, workspace, step_dir, on_progress=None):
     """Run exactly one paid worker turn. The caller checks declared project outputs."""
+    progress = _Progress(step_dir, on_progress)
+    progress.emit("started", f"{agent_id} 正在准备任务。")
     try:
         adapter = agent["adapter"]
         command = _command(adapter, agent)
@@ -538,9 +782,14 @@ def run_worker(agent_id, agent, model, level, task, workspace, step_dir):
         if timeout < 1:
             raise WorkerError("timeout_seconds 必须大于零。")
         run = {"codex": _run_codex, "antigravity": _run_agy, "claude": _run_claude}[adapter]
-        return run(command, model, level, task, Path(workspace), Path(step_dir), timeout)
+        result = run(command, model, level, task, Path(workspace), Path(step_dir), timeout, progress)
     except (WorkerError, OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
-        return _fail(f"{agent_id}：{exc}")
+        result = _fail(f"{agent_id}：{exc}")
+    succeeded = result["status"] == "success"
+    progress.emit("completed" if succeeded else "failed",
+                  f"{agent_id} " + ("已提交执行回执。" if succeeded else "执行失败，请查看结果中的原因。"),
+                  status=result["status"])
+    return result
 
 
 def check_worker(agent_id, agent, models, workspace):
